@@ -23,32 +23,52 @@ const (
 	minTableSlots                 = 32
 	minShardTargetEntries         = 128
 	resizeSpinYieldInterval       = 32
-	unlimitedHits           int64 = -1
+	shardResizing           int64 = 1 << 62
 )
 
-// Option configures a Map at construction time.
 type Option func(*config)
 
-// ValueCloneFunc clones a value at write time and returns an approximate byte size.
 type ValueCloneFunc func(value any) (cloned any, trackedBytes int64)
 
-// EntryOptions controls per-entry expiry and hit limits.
+// EntryOptions configures optional per-entry lifetime rules used by StoreWithOptions,
+// LoadOrStoreWithOptions, and SwapWithOptions.
+//
+// All fields are optional. The zero value means the entry has no TTL and no hit
+// limit, so it remains available until it is overwritten, deleted, or removed by
+// some other operation.
+//
+// Field behavior:
+//
+// TTL is optional. Its default is 0. When TTL is greater than 0, the entry expires
+// that far in the future relative to the write that created or replaced it. When TTL
+// is 0 or negative, time-based expiry is disabled for that entry.
+//
+// Hits is optional. Its default is 0. When Hits is greater than 0, each successful
+// Load call decrements the remaining hit budget and the entry disappears after the
+// final allowed load. When Hits is 0 or negative, hit limiting is disabled and the
+// entry allows unlimited successful loads. Peek, Has, Range, and Snapshot do not
+// consume hits.
+//
+// Example:
+//
+//	options := alosmap.EntryOptions{
+//		TTL:  30 * time.Second,
+//		Hits: 3,
+//	}
+//	store.StoreWithOptions("session:123", "ready", options)
 type EntryOptions struct {
 	TTL  time.Duration
 	Hits int64
 }
 
-// MapCloner lets callers provide deep-copy semantics for custom values without reflection.
 type MapCloner interface {
 	CloneForMap() any
 }
 
-// SizedMapCloner lets callers provide deep-copy semantics plus approximate byte tracking.
 type SizedMapCloner interface {
 	CloneForMapWithSize() (any, int64)
 }
 
-// MapEqualer provides non-reflect equality for custom values used with CAS operations.
 type MapEqualer interface {
 	EqualForMap(other any) bool
 }
@@ -59,20 +79,38 @@ type config struct {
 	shardCount      int
 	cleanupInterval time.Duration
 	cloneValue      ValueCloneFunc
+	hasCustomCloner bool
 }
 
-// Builder provides a fluent constructor for the public API.
+// Builder incrementally configures a Map before construction.
+//
+// Builder provides a fluent alternative to functional options. Each setter records
+// the requested value and returns the same Builder so calls can be chained. Build
+// applies the same normalization rules as New, including default capacity,
+// auto-selected shard count, load-factor clamping, and cleanup interval handling.
 type Builder struct {
 	cfg config
 }
 
-// Pair is a key/value snapshot item returned by Snapshot.
+// Pair represents one key/value item returned by Snapshot.
+//
+// Snapshot returns a flat slice of Pair values so callers can inspect or copy a
+// point-in-time view of the map without holding references to internal tables.
 type Pair struct {
 	Key   string
 	Value any
 }
 
-// Stats exposes live operational metrics for the map.
+// Stats is a point-in-time snapshot of operational counters and size estimates for a Map.
+//
+// Occupancy-related fields include Shards, SlotCapacity, LiveEntries, UsedSlots,
+// Tombstones, LoadFactor, and MaxShardLive. Maintenance-related fields include
+// ResizeCount, WriterSpins, CleanupRuns, CleanupSkips, ExpiredDeletes, and
+// HitDeletes. Memory-related fields include TrackedKeyBytes, TrackedValueBytes,
+// EstimatedOverheadBytes, and EstimatedResidentBytes.
+//
+// All values are observational. In a concurrent program they may change again
+// immediately after Stats returns.
 type Stats struct {
 	Shards                 int
 	SlotCapacity           int
@@ -93,38 +131,52 @@ type Stats struct {
 	MaxShardLive           int64
 }
 
-// Map is a sharded, mostly lock-free concurrent hash map for string keys.
-// Reads are lock-free for normal entries. Writes use atomic publication and only
-// stall when a shard is rebuilding or resizing.
+// Map is a concurrent string-key map optimized for high-throughput reads, mixed workloads,
+// and feature-rich entry lifecycle control.
+//
+// Map stores values as any and publishes updates atomically so readers observe either
+// the old value or the new value, never a partially written state. Read operations on
+// live entries are lock-free. Write operations synchronize only within the shard that
+// owns the key, which allows unrelated keys to proceed in parallel.
+//
+// Each entry may optionally use a TTL, a hit limit, or both. Expired entries and
+// exhausted hit-limited entries are treated as absent. Values are stored by reference
+// unless a custom ValueCloneFunc is supplied, so storing a pointer returns that same
+// pointer from later loads.
 type Map struct {
 	seed            uint64
 	shardMask       uint64
 	shards          []shard
 	cleanupInterval time.Duration
 	cloneValue      ValueCloneFunc
+	noClone         bool
 	stopCleanup     chan struct{}
 	cleanupDone     chan struct{}
 	cleanupClosed   atomic.Bool
 }
 
 type shard struct {
-	table          atomic.Pointer[table]
-	writers        atomic.Int64
-	live           atomic.Int64
-	used           atomic.Int64
-	tombstones     atomic.Int64
+	table        atomic.Pointer[table]
+	loadFactor   float64
+	initialSlots int
+	_readPad     [40]byte
+
+	state        atomic.Int64
+	needsCleanup atomic.Bool
+	live         atomic.Int64
+	used         atomic.Int64
+	tombstones   atomic.Int64
+	keyBytes     atomic.Int64
+	valueBytes   atomic.Int64
+	_writePad    [16]byte
+
 	resizes        atomic.Int64
 	spinWaits      atomic.Int64
 	cleanupRuns    atomic.Int64
 	cleanupSkips   atomic.Int64
 	expiredDeletes atomic.Int64
 	hitDeletes     atomic.Int64
-	keyBytes       atomic.Int64
-	valueBytes     atomic.Int64
-	resizing       atomic.Bool
-	needsCleanup   atomic.Bool
-	loadFactor     float64
-	initialSlots   int
+	_coldPad       [16]byte
 }
 
 type table struct {
@@ -151,42 +203,71 @@ type valueBox struct {
 	hits        atomic.Int64
 }
 
-// NewBuilder returns a fluent builder for the map API.
+type entryBundle struct {
+	ent entry
+	box valueBox
+}
+
+// NewBuilder returns a Builder initialized with the package defaults.
+//
+// This is the fluent alternative to calling New with functional options directly.
+// Call the Builder methods you need and finish with Build.
 func NewBuilder() *Builder {
 	return &Builder{cfg: defaultConfig()}
 }
 
-// Capacity sets the expected live entry count.
+// Capacity sets the expected live entry count used for initial sizing.
+//
+// Capacity is optional. When omitted, Build falls back to the package default of
+// 1024 expected entries. Values less than 1 are normalized to that same default.
+// Capacity is not a hard limit; it only guides the initial table size.
 func (b *Builder) Capacity(capacity int) *Builder {
 	b.cfg.capacity = capacity
 	return b
 }
 
-// Shards sets the shard count. Values are rounded up to the next power of two.
+// Shards sets the requested shard count for the map.
+//
+// The requested value is normalized during Build. Values greater than 0 are rounded
+// up to the next power of two. Values less than or equal to 0 cause Build to use the
+// package's automatic shard-selection heuristic.
 func (b *Builder) Shards(count int) *Builder {
 	b.cfg.shardCount = count
 	return b
 }
 
-// LoadFactor sets the live-entry occupancy target before a shard grows.
+// LoadFactor sets the target occupancy before a shard grows.
+//
+// LoadFactor is optional. When omitted, the default is 0.72. Values smaller than
+// 0.50 are clamped to 0.50, and values larger than 0.90 are clamped to 0.90.
 func (b *Builder) LoadFactor(loadFactor float64) *Builder {
 	b.cfg.loadFactor = loadFactor
 	return b
 }
 
-// CleanupInterval sets the background cleanup tick. Zero disables the background cleaner.
+// CleanupInterval sets the cadence of the background cleanup goroutine.
+//
+// CleanupInterval is optional. The default is 5 seconds. A value of 0 disables the
+// background cleaner entirely. Negative values are normalized to 0 during Build.
 func (b *Builder) CleanupInterval(interval time.Duration) *Builder {
 	b.cfg.cleanupInterval = interval
 	return b
 }
 
-// ValueCloner overrides the write-time clone function.
+// ValueCloner installs a custom write-time cloning function.
+//
+// By default the map stores values exactly as supplied. Providing a ValueCloner lets
+// you copy mutable values before publication and report an approximate byte size for
+// Stats. A nil cloner falls back to the default pass-through behavior.
 func (b *Builder) ValueCloner(cloner ValueCloneFunc) *Builder {
 	b.cfg.cloneValue = cloner
 	return b
 }
 
-// Build constructs the map from the builder configuration.
+// Build constructs a Map from the Builder configuration.
+//
+// Build applies the same normalization and defaulting rules as New, so the result is
+// identical to assembling the equivalent functional options manually.
 func (b *Builder) Build() *Map {
 	return New(
 		WithCapacity(b.cfg.capacity),
@@ -197,49 +278,78 @@ func (b *Builder) Build() *Map {
 	)
 }
 
-// WithCapacity sets the expected live entry count.
+// WithCapacity returns an Option that sets the expected live entry count for initial sizing.
+//
+// The default is 1024 when this option is omitted. Values less than 1 are normalized
+// to the default. Capacity influences initial allocation and resize behavior; it does
+// not enforce a maximum size.
 func WithCapacity(capacity int) Option {
 	return func(cfg *config) {
 		cfg.capacity = capacity
 	}
 }
 
-// WithShardCount sets the number of shards. Values are rounded up to the next power of two.
+// WithShardCount returns an Option that sets the requested shard count.
+//
+// Positive values are rounded up to the next power of two. Zero or negative values
+// cause New to select a shard count automatically from the expected capacity.
 func WithShardCount(count int) Option {
 	return func(cfg *config) {
 		cfg.shardCount = count
 	}
 }
 
-// WithLoadFactor sets the live-entry occupancy target before a shard grows.
+// WithLoadFactor returns an Option that sets the target occupancy before a shard grows.
+//
+// The default is 0.72. Values are clamped into the inclusive range [0.50, 0.90].
 func WithLoadFactor(loadFactor float64) Option {
 	return func(cfg *config) {
 		cfg.loadFactor = loadFactor
 	}
 }
 
-// WithCleanupInterval configures the background cleanup interval. Zero disables it.
+// WithCleanupInterval returns an Option that sets the background cleanup interval.
+//
+// The default is 5 seconds. A value of 0 disables background cleanup. Negative values
+// are normalized to 0.
 func WithCleanupInterval(interval time.Duration) Option {
 	return func(cfg *config) {
 		cfg.cleanupInterval = interval
 	}
 }
 
-// WithoutCleanup disables the background cleanup ticker.
+// WithoutCleanup returns an Option that disables the background cleanup goroutine.
+//
+// This is equivalent to setting the cleanup interval to 0.
 func WithoutCleanup() Option {
 	return func(cfg *config) {
 		cfg.cleanupInterval = 0
 	}
 }
 
-// WithValueCloner overrides the write-time clone function.
+// WithValueCloner returns an Option that installs a custom write-time clone function.
+//
+// Use this when stored values should be copied before publication or when Stats should
+// track approximate cloned value sizes. A nil cloner falls back to pass-through storage.
 func WithValueCloner(cloner ValueCloneFunc) Option {
 	return func(cfg *config) {
 		cfg.cloneValue = cloner
 	}
 }
 
-// New constructs a new custom concurrent map.
+// New constructs a Map from the provided options.
+//
+// Defaults used when options are omitted are:
+//
+//	Capacity: 1024 expected live entries
+//	Shard count: automatically selected from capacity and GOMAXPROCS
+//	Load factor: 0.72
+//	Cleanup interval: 5 seconds
+//	Value cloner: pass-through storage with zero tracked value bytes
+//
+// Options are normalized before construction. Capacity values below 1 fall back to
+// the default, shard counts are rounded to a power of two or auto-selected, load
+// factor is clamped to [0.50, 0.90], and negative cleanup intervals are treated as 0.
 func New(options ...Option) *Map {
 	cfg := defaultConfig()
 	for _, option := range options {
@@ -260,6 +370,7 @@ func New(options ...Option) *Map {
 		shards:          make([]shard, cfg.shardCount),
 		cleanupInterval: cfg.cleanupInterval,
 		cloneValue:      cfg.cloneValue,
+		noClone:         !cfg.hasCustomCloner,
 	}
 
 	perShardEntries := divideRoundUp(cfg.capacity, cfg.shardCount)
@@ -312,6 +423,8 @@ func (cfg *config) normalize() {
 	}
 	if cfg.cloneValue == nil {
 		cfg.cloneValue = defaultCloneValue
+	} else {
+		cfg.hasCustomCloner = true
 	}
 }
 
@@ -341,7 +454,10 @@ func autoShardCount(capacity int) int {
 	return floorPowerOfTwo(target)
 }
 
-// RecommendedShardCount returns the auto-tuned shard count for the requested capacity.
+// RecommendedShardCount returns the shard count heuristic used for a given expected capacity.
+//
+// This is useful when you want to size the map explicitly but still reuse the package's
+// automatic shard-selection logic for large deployments.
 func RecommendedShardCount(expectedEntries int) int {
 	if expectedEntries < 1 {
 		expectedEntries = 1
@@ -364,7 +480,10 @@ func (m *Map) cleanupLoop() {
 	}
 }
 
-// Close stops the background cleanup goroutine.
+// Close stops the background cleanup goroutine, if one was started.
+//
+// Close is idempotent and safe to call multiple times. It does not invalidate the map;
+// it only disables automatic cleanup work running in the background.
 func (m *Map) Close() {
 	if m.stopCleanup == nil {
 		return
@@ -375,131 +494,162 @@ func (m *Map) Close() {
 	}
 }
 
-// Set stores a value for the provided key.
-func (m *Map) Set(key string, value any) {
-	m.Store(key, value)
-}
-
-// Store stores a value for the provided key.
+// Store writes value at key using the default entry behavior.
+//
+// Store replaces any existing live value for the key. The new entry has no TTL and no
+// hit limit. Values are stored by reference unless a custom ValueCloneFunc is configured.
 func (m *Map) Store(key string, value any) {
 	m.StoreWithOptions(key, value, EntryOptions{})
 }
 
-// StoreWithTTL stores a value with a time-to-live.
+// StoreWithTTL writes value at key and applies a TTL.
+//
+// When ttl is greater than 0, the entry expires relative to the time of this write.
+// When ttl is 0 or negative, the entry behaves like Store and has no time-based expiry.
 func (m *Map) StoreWithTTL(key string, value any, ttl time.Duration) {
 	m.StoreWithOptions(key, value, EntryOptions{TTL: ttl})
 }
 
-// StoreWithHits stores a value that is automatically deleted after the configured number of successful loads.
+// StoreWithHits writes value at key and applies a hit limit.
+//
+// Hits greater than 0 allow that many successful Load calls before the entry is removed.
+// Hits equal to 0 or less disable hit limiting and allow unlimited successful loads.
 func (m *Map) StoreWithHits(key string, value any, hits int64) {
 	m.StoreWithOptions(key, value, EntryOptions{Hits: hits})
 }
 
-// StoreWithTTLAndHits stores a value with both a TTL and a hit limit.
+// StoreWithTTLAndHits writes value at key with both TTL and hit-limit behavior.
+//
+// TTL and Hits follow the same rules documented by EntryOptions. Either control may
+// effectively be disabled by passing a non-positive value.
 func (m *Map) StoreWithTTLAndHits(key string, value any, ttl time.Duration, hits int64) {
 	m.StoreWithOptions(key, value, EntryOptions{TTL: ttl, Hits: hits})
 }
 
-// SetWithTTLAndHits is an alias for StoreWithTTLAndHits.
+// SetWithTTLAndHits writes value at key with both TTL and hit-limit behavior.
+//
+// It is provided as a naming alias for callers that prefer Set-style method names.
+// Its behavior is identical to StoreWithTTLAndHits.
 func (m *Map) SetWithTTLAndHits(key string, value any, ttl time.Duration, hits int64) {
 	m.StoreWithTTLAndHits(key, value, ttl, hits)
 }
 
-// StoreWithOptions stores a value with per-entry expiry settings.
+// StoreWithOptions writes value at key and applies the supplied EntryOptions.
+//
+// This is the most general write API for creating or replacing an entry. The zero
+// value of EntryOptions gives the same behavior as Store.
 func (m *Map) StoreWithOptions(key string, value any, options EntryOptions) {
 	hash := hashString(m.seed, key)
 	boxed := m.newValueBox(value, options)
 	m.pickShard(hash).store(hash, key, boxed)
 }
 
-// Load retrieves a value by key and consumes one hit when the entry is hit-limited.
+// Load returns the current live value for key.
+//
+// For hit-limited entries, each successful Load consumes one remaining hit. Expired
+// entries and exhausted hit-limited entries are treated as missing and return ok=false.
 func (m *Map) Load(key string) (any, bool) {
 	hash := hashString(m.seed, key)
 	return m.pickShard(hash).load(hash, key)
 }
 
-// Get is an alias for Load.
+// Get returns the current live value for key.
+//
+// Get is a naming alias for Load and therefore has identical behavior, including
+// hit consumption on successful reads of hit-limited entries.
 func (m *Map) Get(key string) (any, bool) {
 	return m.Load(key)
 }
 
-// Peek retrieves a value by key without consuming hit counters.
+// Peek returns the current live value for key without consuming hit counters.
+//
+// Expired and exhausted entries are treated as absent in the same way as Load.
 func (m *Map) Peek(key string) (any, bool) {
 	hash := hashString(m.seed, key)
 	return m.pickShard(hash).peek(hash, key)
 }
 
-// GetOrDefault returns the stored value or the provided fallback.
-func (m *Map) GetOrDefault(key string, fallback any) any {
-	if value, ok := m.Load(key); ok {
-		return value
-	}
-	return fallback
-}
-
-// PeekOrDefault returns the stored value without consuming hits or the provided fallback.
-func (m *Map) PeekOrDefault(key string, fallback any) any {
-	if value, ok := m.Peek(key); ok {
-		return value
-	}
-	return fallback
-}
-
-// Has reports whether the key currently exists in the map without consuming hits.
+// Has reports whether key currently resolves to a live entry.
+//
+// Has does not consume hit counters.
 func (m *Map) Has(key string) bool {
 	_, ok := m.Peek(key)
 	return ok
 }
 
-// Delete removes a key and returns the prior value when present.
+// Delete removes key and returns the previous live value when present.
+//
+// If the key is absent, expired, or already exhausted, Delete returns nil, false.
 func (m *Map) Delete(key string) (any, bool) {
 	hash := hashString(m.seed, key)
 	return m.pickShard(hash).delete(hash, key)
 }
 
-// LoadOrStore returns the existing value if present or stores the supplied one.
+// LoadOrStore returns the existing live value for key or stores value when the key is absent.
+//
+// The inserted value uses the default entry behavior: no TTL and no hit limit.
 func (m *Map) LoadOrStore(key string, value any) (any, bool) {
 	return m.LoadOrStoreWithOptions(key, value, EntryOptions{})
 }
 
-// LoadOrStoreWithOptions returns the existing value if present or stores the supplied one using the provided entry options.
+// LoadOrStoreWithOptions returns the existing live value for key or stores value with EntryOptions.
+//
+// If the current entry is expired or already exhausted, it is treated as absent and a
+// new entry may be installed.
 func (m *Map) LoadOrStoreWithOptions(key string, value any, options EntryOptions) (any, bool) {
 	hash := hashString(m.seed, key)
-	boxed := m.newValueBox(value, options)
-	return m.pickShard(hash).loadOrStore(hash, key, boxed)
+	s := m.pickShard(hash)
+	var cf ValueCloneFunc
+	if !m.noClone {
+		cf = m.cloneValue
+	}
+	return s.loadOrStoreDeferred(hash, key, value, options, cf)
 }
 
-// Swap replaces the value for a key and returns the previous value if there was one.
+// Swap atomically replaces the value for key and returns the previous live value when present.
+//
+// The replacement entry uses the default behavior of no TTL and no hit limit.
 func (m *Map) Swap(key string, value any) (any, bool) {
 	return m.SwapWithOptions(key, value, EntryOptions{})
 }
 
-// SwapWithOptions replaces the value for a key using the provided entry options.
+// SwapWithOptions atomically replaces the value for key and applies EntryOptions to the replacement.
+//
+// It returns the previous live value and true when a value existed, or nil and false
+// when the key was absent.
 func (m *Map) SwapWithOptions(key string, value any, options EntryOptions) (any, bool) {
 	hash := hashString(m.seed, key)
 	boxed := m.newValueBox(value, options)
 	return m.pickShard(hash).swap(hash, key, boxed)
 }
 
-// CompareAndSwap swaps the value if the current value matches oldValue.
+// CompareAndSwap replaces the current value only when it matches oldValue.
+//
+// Value comparison uses the package's equality rules, including MapEqualer support and
+// special handling for several slice and map forms used by the implementation.
 func (m *Map) CompareAndSwap(key string, oldValue any, newValue any) bool {
 	return m.CompareAndSwapWithOptions(key, oldValue, newValue, EntryOptions{})
 }
 
-// CompareAndSwapWithOptions swaps the value if the current value matches oldValue and applies entry options to the new value.
+// CompareAndSwapWithOptions replaces the current value only when it matches oldValue and
+// applies EntryOptions to the replacement.
 func (m *Map) CompareAndSwapWithOptions(key string, oldValue any, newValue any, options EntryOptions) bool {
 	hash := hashString(m.seed, key)
 	boxed := m.newValueBox(newValue, options)
 	return m.pickShard(hash).compareAndSwap(hash, key, oldValue, boxed)
 }
 
-// CompareAndDelete deletes a key if the current value matches oldValue.
+// CompareAndDelete removes key only when the current value matches oldValue.
+//
+// It returns true when the delete succeeds and false otherwise.
 func (m *Map) CompareAndDelete(key string, oldValue any) bool {
 	hash := hashString(m.seed, key)
 	return m.pickShard(hash).compareAndDelete(hash, key, oldValue)
 }
 
-// Len returns the current live entry count.
+// Len returns the current number of live entries.
+//
+// Len excludes deleted, expired, and exhausted entries.
 func (m *Map) Len() int {
 	return int(m.len64())
 }
@@ -512,14 +662,20 @@ func (m *Map) len64() int64 {
 	return total
 }
 
-// Clear removes all keys and scales the table back toward its initial footprint.
+// Clear removes all keys from the map and resets shard tables toward their initial size.
+//
+// Clear does not stop the background cleaner and does not make the map unusable.
 func (m *Map) Clear() {
 	for index := range m.shards {
 		m.shards[index].clear()
 	}
 }
 
-// CleanupNow runs an immediate cleanup pass across all shards.
+// CleanupNow forces an immediate maintenance pass across all shards.
+//
+// Cleanup removes expired entries, removes exhausted hit-limited entries, and may
+// compact or shrink shard tables when the implementation determines that rebuilding
+// would be beneficial.
 func (m *Map) CleanupNow() {
 	now := time.Now().UnixNano()
 	for index := range m.shards {
@@ -527,8 +683,11 @@ func (m *Map) CleanupNow() {
 	}
 }
 
-// Range iterates over the current contents of the map without consuming hit counters.
-// It provides an eventually-consistent view when writes are happening concurrently.
+// Range visits the current live entries in the map.
+//
+// Range does not consume hit counters. Iteration order is unspecified. When writes
+// happen concurrently, Range provides an eventually consistent view rather than a
+// locked snapshot. Returning false from visitor stops the iteration early.
 func (m *Map) Range(visitor func(key string, value any) bool) {
 	for index := range m.shards {
 		currentShard := &m.shards[index]
@@ -549,7 +708,10 @@ func (m *Map) Range(visitor func(key string, value any) bool) {
 	}
 }
 
-// Snapshot returns the map contents as a flat slice of key/value pairs.
+// Snapshot returns a flat slice containing the map's current live entries.
+//
+// Snapshot is built by calling Range and therefore has the same eventual-consistency
+// behavior under concurrent writes.
 func (m *Map) Snapshot() []Pair {
 	pairs := make([]Pair, 0, m.Len())
 	m.Range(func(key string, value any) bool {
@@ -559,7 +721,10 @@ func (m *Map) Snapshot() []Pair {
 	return pairs
 }
 
-// Stats returns operational metrics aggregated across all shards.
+// Stats returns a point-in-time snapshot of aggregated operational metrics.
+//
+// The returned counters and estimates are useful for sizing, observability, and
+// debugging. Because the map may be changing concurrently, the snapshot is approximate.
 func (m *Map) Stats() Stats {
 	stats := Stats{Shards: len(m.shards)}
 	for index := range m.shards {
@@ -598,7 +763,9 @@ func (m *Map) newValueBox(value any, options EntryOptions) *valueBox {
 		value:       clonedValue,
 		clonedBytes: trackedBytes,
 	}
-	boxed.hits.Store(normalizeHits(options.Hits))
+	if options.Hits > 0 {
+		boxed.hits.Store(options.Hits)
+	}
 	if options.TTL > 0 {
 		boxed.expiresAt = time.Now().Add(options.TTL).UnixNano()
 	}
@@ -647,7 +814,7 @@ func (s *shard) readEntry(current *entry, consumeHits bool) (any, bool) {
 		}
 
 		if !consumeHits {
-			if boxed.hits.Load() == 0 {
+			if boxed.hits.Load() < 0 {
 				if s.clearIfMatch(current, boxed, false, true) {
 					s.maybeResize()
 					return nil, false
@@ -758,6 +925,185 @@ outer:
 		s.resize(int(s.live.Load()) + 1)
 	}
 }
+func (s *shard) loadOrStoreDeferred(hash uint64, key string, value any, options EntryOptions, cloneFunc ValueCloneFunc) (any, bool) {
+	currentTable := s.table.Load()
+	idx := int(hash & currentTable.mask)
+	emptyIdx := -1
+	for probes := 0; probes < len(currentTable.slots); probes++ {
+		current := currentTable.slots[idx].entry.Load()
+		if current == nil {
+			emptyIdx = idx
+			break
+		}
+		if current.hash == hash && current.key == key {
+			existing := current.value.Load()
+			if existing != nil && existing.expiresAt == 0 && existing.hits.Load() == 0 {
+				return existing.value, true
+			}
+			break
+		}
+		idx = (idx + 1) & int(currentTable.mask)
+	}
+
+	if emptyIdx >= 0 {
+		var cloned any
+		var trackedBytes int64
+		if cloneFunc != nil {
+			cloned, trackedBytes = cloneFunc(value)
+		} else {
+			cloned = value
+		}
+		bundle := &entryBundle{}
+		bundle.ent.hash = hash
+		bundle.ent.key = strings.Clone(key)
+		bundle.ent.keyBytes = int64(len(key))
+		bundle.box.value = cloned
+		bundle.box.clonedBytes = trackedBytes
+		if options.Hits > 0 {
+			bundle.box.hits.Store(options.Hits)
+		}
+		if options.TTL > 0 {
+			bundle.box.expiresAt = time.Now().Add(options.TTL).UnixNano()
+		}
+		bundle.ent.value.Store(&bundle.box)
+
+		if currentTable.slots[emptyIdx].entry.CompareAndSwap(nil, &bundle.ent) {
+			if s.table.Load() == currentTable {
+				s.live.Add(1)
+				used := s.used.Add(1)
+				s.keyBytes.Add(bundle.ent.keyBytes)
+				if trackedBytes > 0 {
+					s.valueBytes.Add(trackedBytes)
+				}
+				if bundle.box.requiresCleanup() {
+					s.needsCleanup.Store(true)
+				}
+				if used >= int64(currentTable.growAt) {
+					s.resize(int(s.live.Load()) + 1)
+				}
+				return cloned, false
+			}
+			if findEntry(s.table.Load(), hash, key) == &bundle.ent {
+				return cloned, false
+			}
+		}
+	}
+
+	return s.loadOrStoreSlow(hash, key, value, options, cloneFunc)
+}
+
+func (s *shard) loadOrStoreSlow(hash uint64, key string, value any, options EntryOptions, cloneFunc ValueCloneFunc) (any, bool) {
+outer:
+	for {
+		s.beginWrite()
+		currentTable := s.table.Load()
+		index := int(hash & currentTable.mask)
+
+		for probes := 0; probes < len(currentTable.slots); probes++ {
+			current := currentTable.slots[index].entry.Load()
+			if current == nil {
+				var cloned any
+				var trackedBytes int64
+				if cloneFunc != nil {
+					cloned, trackedBytes = cloneFunc(value)
+				} else {
+					cloned = value
+				}
+				bundle := &entryBundle{}
+				bundle.ent.hash = hash
+				bundle.ent.key = strings.Clone(key)
+				bundle.ent.keyBytes = int64(len(key))
+				bundle.box.value = cloned
+				bundle.box.clonedBytes = trackedBytes
+				if options.Hits > 0 {
+					bundle.box.hits.Store(options.Hits)
+				}
+				if options.TTL > 0 {
+					bundle.box.expiresAt = time.Now().Add(options.TTL).UnixNano()
+				}
+				bundle.ent.value.Store(&bundle.box)
+
+				if currentTable.slots[index].entry.CompareAndSwap(nil, &bundle.ent) {
+					s.live.Add(1)
+					used := s.used.Add(1)
+					s.keyBytes.Add(bundle.ent.keyBytes)
+					if trackedBytes > 0 {
+						s.valueBytes.Add(trackedBytes)
+					}
+					if bundle.box.requiresCleanup() {
+						s.needsCleanup.Store(true)
+					}
+					resizeNeeded := used >= int64(currentTable.growAt)
+					s.endWrite()
+					if resizeNeeded {
+						s.resize(int(s.live.Load()) + 1)
+					}
+					return cloned, false
+				}
+				s.endWrite()
+				continue outer
+			}
+
+			if current.hash == hash && current.key == key {
+				revive := false
+				for {
+					existing := current.value.Load()
+					if existing == nil {
+						revive = true
+						break
+					}
+					if existing.expiresAt > 0 && time.Now().UnixNano() >= existing.expiresAt {
+						if s.clearIfMatch(current, existing, true, false) {
+							revive = true
+							break
+						}
+						continue
+					}
+					if existing.hits.Load() < 0 {
+						if s.clearIfMatch(current, existing, false, true) {
+							revive = true
+							break
+						}
+						continue
+					}
+					s.endWrite()
+					return existing.value, true
+				}
+				if revive {
+					var cloned any
+					var trackedBytes int64
+					if cloneFunc != nil {
+						cloned, trackedBytes = cloneFunc(value)
+					} else {
+						cloned = value
+					}
+					boxed := &valueBox{
+						value:       cloned,
+						clonedBytes: trackedBytes,
+					}
+					if options.Hits > 0 {
+						boxed.hits.Store(options.Hits)
+					}
+					if options.TTL > 0 {
+						boxed.expiresAt = time.Now().Add(options.TTL).UnixNano()
+					}
+					actual, loaded := s.loadOrStoreCurrent(current, boxed)
+					resizeNeeded := !loaded && s.shouldResizeWithTable(currentTable)
+					s.endWrite()
+					if resizeNeeded {
+						s.resize(int(s.live.Load()))
+					}
+					return actual, loaded
+				}
+			}
+
+			index = (index + 1) & int(currentTable.mask)
+		}
+
+		s.endWrite()
+		s.resize(int(s.live.Load()) + 1)
+	}
+}
 
 func (s *shard) swap(hash uint64, key string, boxed *valueBox) (any, bool) {
 outer:
@@ -830,7 +1176,7 @@ func (s *shard) delete(hash uint64, key string) (any, bool) {
 				continue
 			}
 
-			if boxed.hits.Load() == 0 {
+			if boxed.hits.Load() < 0 {
 				if s.clearIfMatch(current, boxed, false, true) {
 					resizeNeeded := s.shouldResizeWithTable(currentTable)
 					s.endWrite()
@@ -888,7 +1234,7 @@ func (s *shard) compareAndSwap(hash uint64, key string, oldValue any, boxed *val
 				continue
 			}
 
-			if existing.hits.Load() == 0 {
+			if existing.hits.Load() < 0 {
 				if s.clearIfMatch(current, existing, false, true) {
 					resizeNeeded := s.shouldResizeWithTable(currentTable)
 					s.endWrite()
@@ -950,7 +1296,7 @@ func (s *shard) compareAndDelete(hash uint64, key string, oldValue any) bool {
 				continue
 			}
 
-			if existing.hits.Load() == 0 {
+			if existing.hits.Load() < 0 {
 				if s.clearIfMatch(current, existing, false, true) {
 					resizeNeeded := s.shouldResizeWithTable(currentTable)
 					s.endWrite()
@@ -985,13 +1331,20 @@ func (s *shard) compareAndDelete(hash uint64, key string, oldValue any) bool {
 }
 
 func (s *shard) clear() {
-	for !s.resizing.CompareAndSwap(false, true) {
-		runtime.Gosched()
+	for {
+		old := s.state.Load()
+		if old&shardResizing != 0 {
+			runtime.Gosched()
+			continue
+		}
+		if s.state.CompareAndSwap(old, old|shardResizing) {
+			break
+		}
 	}
-	defer s.resizing.Store(false)
+	defer s.state.Add(-shardResizing)
 
 	spins := int64(0)
-	for s.writers.Load() != 0 {
+	for s.state.Load() != shardResizing {
 		spins++
 		if spins%resizeSpinYieldInterval == 0 {
 			runtime.Gosched()
@@ -1024,25 +1377,32 @@ func (s *shard) cleanup(now int64) {
 }
 
 func (s *shard) beginWrite() {
-	spins := int64(0)
+	v := s.state.Add(1)
+	if v&shardResizing != 0 {
+		s.state.Add(-1)
+		s.beginWriteSlow()
+	}
+}
 
+func (s *shard) beginWriteSlow() {
+	spins := int64(0)
 	for {
-		for s.resizing.Load() {
+		for s.state.Load()&shardResizing != 0 {
 			spins++
 			if spins%resizeSpinYieldInterval == 0 {
 				runtime.Gosched()
 			}
 		}
 
-		s.writers.Add(1)
-		if !s.resizing.Load() {
+		v := s.state.Add(1)
+		if v&shardResizing == 0 {
 			if spins != 0 {
 				s.spinWaits.Add(spins)
 			}
 			return
 		}
 
-		s.writers.Add(-1)
+		s.state.Add(-1)
 		spins++
 		if spins%resizeSpinYieldInterval == 0 {
 			runtime.Gosched()
@@ -1051,7 +1411,7 @@ func (s *shard) beginWrite() {
 }
 
 func (s *shard) endWrite() {
-	s.writers.Add(-1)
+	s.state.Add(-1)
 }
 
 func (s *shard) insertFresh(currentTable *table, index int, hash uint64, key string, boxed *valueBox) (bool, bool, bool) {
@@ -1065,7 +1425,9 @@ func (s *shard) insertFresh(currentTable *table, index int, hash uint64, key str
 		s.live.Add(1)
 		used := s.used.Add(1)
 		s.keyBytes.Add(fresh.keyBytes)
-		s.valueBytes.Add(boxed.clonedBytes)
+		if boxed.clonedBytes > 0 {
+			s.valueBytes.Add(boxed.clonedBytes)
+		}
 		if boxed.requiresCleanup() {
 			s.needsCleanup.Store(true)
 		}
@@ -1098,7 +1460,7 @@ func (s *shard) replaceOrRevive(current *entry, boxed *valueBox) (any, bool) {
 			continue
 		}
 
-		if existing.hits.Load() == 0 {
+		if existing.hits.Load() < 0 {
 			if s.clearIfMatch(current, existing, false, true) {
 				continue
 			}
@@ -1139,7 +1501,7 @@ func (s *shard) loadOrStoreCurrent(current *entry, boxed *valueBox) (any, bool) 
 			continue
 		}
 
-		if existing.hits.Load() == 0 {
+		if existing.hits.Load() < 0 {
 			if s.clearIfMatch(current, existing, false, true) {
 				continue
 			}
@@ -1180,13 +1542,17 @@ func (s *shard) resize(minLiveEntries int) {
 }
 
 func (s *shard) resizeAt(minLiveEntries int, now int64, force bool) {
-	if !s.resizing.CompareAndSwap(false, true) {
+	old := s.state.Load()
+	if old&shardResizing != 0 {
 		return
 	}
-	defer s.resizing.Store(false)
+	if !s.state.CompareAndSwap(old, old|shardResizing) {
+		return
+	}
+	defer s.state.Add(-shardResizing)
 
 	spins := int64(0)
-	for s.writers.Load() != 0 {
+	for s.state.Load() != shardResizing {
 		spins++
 		if spins%resizeSpinYieldInterval == 0 {
 			runtime.Gosched()
@@ -1225,9 +1591,9 @@ func (s *shard) resizeAt(minLiveEntries int, now int64, force bool) {
 			}
 		}
 		hits := boxed.hits.Load()
-		if hits >= 0 {
+		if hits != 0 {
 			needsCleanup = true
-			if hits == 0 {
+			if hits < 0 {
 				hitRemoved++
 				continue
 			}
@@ -1259,13 +1625,11 @@ func (s *shard) resizeAt(minLiveEntries int, now int64, force bool) {
 		if boxed.expiresAt > 0 && now >= boxed.expiresAt {
 			continue
 		}
-		if hits := boxed.hits.Load(); hits == 0 {
+		if hits := boxed.hits.Load(); hits < 0 {
 			continue
 		}
 
-		clone := &entry{hash: current.hash, key: current.key, keyBytes: current.keyBytes}
-		clone.value.Store(boxed)
-		rebuilt.insertClone(clone)
+		rebuilt.insertClone(current)
 	}
 
 	s.table.Store(rebuilt)
@@ -1291,7 +1655,7 @@ func (s *shard) targetSlotCount(currentTable *table, liveEntries int, force bool
 
 	switch {
 	case used >= currentTable.growAt || required > target:
-		target = maxInt(target<<1, required)
+		target = maxInt(target<<2, required)
 	case target > s.initialSlots && tombstones > 0 && tombstones*4 >= maxInt(used, 1):
 		target = required
 	case target > s.initialSlots && required*2 < target:
@@ -1391,120 +1755,37 @@ func slotsForEntries(entries int, loadFactor float64) int {
 
 func normalizeHits(hits int64) int64 {
 	if hits <= 0 {
-		return unlimitedHits
+		return 0
 	}
 	return hits
 }
 
 func (b *valueBox) requiresCleanup() bool {
-	return b.expiresAt > 0 || b.hits.Load() >= 0
+	return b.expiresAt > 0 || b.hits.Load() != 0
 }
 
 func (b *valueBox) consumeHit() (consumed bool, exhausted bool) {
 	for {
 		hits := b.hits.Load()
 		switch {
-		case hits < 0:
-			return true, false
 		case hits == 0:
+			return true, false
+		case hits < 0:
 			return false, true
 		default:
-			if b.hits.CompareAndSwap(hits, hits-1) {
-				return true, hits == 1
+			next := hits - 1
+			if next == 0 {
+				next = -1
+			}
+			if b.hits.CompareAndSwap(hits, next) {
+				return true, next < 0
 			}
 		}
 	}
 }
 
 func defaultCloneValue(value any) (any, int64) {
-	switch typed := value.(type) {
-	case nil:
-		return nil, 0
-	case SizedMapCloner:
-		return typed.CloneForMapWithSize()
-	case MapCloner:
-		return typed.CloneForMap(), 0
-	case string:
-		cloned := strings.Clone(typed)
-		return cloned, int64(len(cloned))
-	case []byte:
-		cloned := slices.Clone(typed)
-		return cloned, int64(len(cloned))
-	case []string:
-		cloned := make([]string, len(typed))
-		total := int64(len(cloned)) * int64(unsafe.Sizeof(string("")))
-		for index := range typed {
-			cloned[index] = strings.Clone(typed[index])
-			total += int64(len(cloned[index]))
-		}
-		return cloned, total
-	case []int:
-		cloned := slices.Clone(typed)
-		return cloned, int64(len(cloned)) * int64(unsafe.Sizeof(int(0)))
-	case []int64:
-		cloned := slices.Clone(typed)
-		return cloned, int64(len(cloned)) * int64(unsafe.Sizeof(int64(0)))
-	case []uint64:
-		cloned := slices.Clone(typed)
-		return cloned, int64(len(cloned)) * int64(unsafe.Sizeof(uint64(0)))
-	case []bool:
-		cloned := slices.Clone(typed)
-		return cloned, int64(len(cloned)) * int64(unsafe.Sizeof(false))
-	case []float64:
-		cloned := slices.Clone(typed)
-		return cloned, int64(len(cloned)) * int64(unsafe.Sizeof(float64(0)))
-	case []rune:
-		cloned := slices.Clone(typed)
-		return cloned, int64(len(cloned)) * int64(unsafe.Sizeof(rune(0)))
-	case []any:
-		cloned := make([]any, len(typed))
-		total := int64(len(cloned)) * int64(unsafe.Sizeof(any(nil)))
-		for index := range typed {
-			item, bytes := defaultCloneValue(typed[index])
-			cloned[index] = item
-			total += bytes
-		}
-		return cloned, total
-	case [][]byte:
-		cloned := make([][]byte, len(typed))
-		total := int64(len(cloned)) * int64(unsafe.Sizeof([]byte(nil)))
-		for index := range typed {
-			cloned[index] = slices.Clone(typed[index])
-			total += int64(len(cloned[index]))
-		}
-		return cloned, total
-	case map[string]string:
-		cloned := make(map[string]string, len(typed))
-		total := int64(0)
-		for key, value := range typed {
-			copyKey := strings.Clone(key)
-			copyValue := strings.Clone(value)
-			cloned[copyKey] = copyValue
-			total += int64(len(copyKey) + len(copyValue))
-		}
-		return cloned, total
-	case map[string]int:
-		cloned := make(map[string]int, len(typed))
-		total := int64(0)
-		for key, value := range typed {
-			copyKey := strings.Clone(key)
-			cloned[copyKey] = value
-			total += int64(len(copyKey)) + int64(unsafe.Sizeof(value))
-		}
-		return cloned, total
-	case map[string]any:
-		cloned := make(map[string]any, len(typed))
-		total := int64(0)
-		for key, value := range typed {
-			copyKey := strings.Clone(key)
-			copyValue, bytes := defaultCloneValue(value)
-			cloned[copyKey] = copyValue
-			total += int64(len(copyKey)) + bytes
-		}
-		return cloned, total
-	default:
-		return value, 0
-	}
+	return value, 0
 }
 
 func valuesEqual(left any, right any) bool {
