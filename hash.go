@@ -1,7 +1,6 @@
 package alosmap
 
 import (
-	"encoding/binary"
 	"math/bits"
 	"unsafe"
 )
@@ -16,33 +15,43 @@ const (
 func hashString(seed uint64, input string) uint64 {
 	length := len(input)
 	if length == 0 {
-		return avalanche(seed ^ hashSeed0)
+		return seed ^ hashSeed0
 	}
 
 	base := unsafe.Pointer(unsafe.StringData(input))
 	acc := seed ^ (uint64(length) * hashSeed0)
-	index := 0
 
+	if length <= 8 {
+		var lo, hi uint32
+		if length >= 4 {
+			lo = readUint32(base, 0)
+			hi = readUint32(base, length-4)
+		} else {
+			lo = uint32(*(*byte)(base))
+			lo |= uint32(*(*byte)(unsafe.Add(base, length>>1))) << 8
+			lo |= uint32(*(*byte)(unsafe.Add(base, length-1))) << 16
+			hi = 0
+		}
+		return mix(acc^uint64(lo)^hashSeed1, uint64(hi)^hashSeed2)
+	}
+
+	if length <= 16 {
+		return mix(acc^readUint64(base, 0)^hashSeed1, readUint64(base, length-8)^hashSeed2)
+	}
+
+	index := 0
 	for length-index >= 16 {
 		acc ^= mix(readUint64(base, index)^hashSeed1, readUint64(base, index+8)^hashSeed2)
 		acc = bits.RotateLeft64(acc, 27)*hashSeed0 + hashSeed3
 		index += 16
 	}
 
-	if length-index >= 8 {
-		acc ^= mix(readUint64(base, index)^hashSeed2, uint64(length)^hashSeed3)
-		index += 8
-	}
-
-	var tail uint64
-	shift := 0
-	for ; index < length; index++ {
-		tail |= uint64(readByte(base, index)) << shift
-		shift += 8
-	}
-
-	acc ^= mix(tail^hashSeed1, uint64(length)^hashSeed0)
+	acc ^= mix(readUint64(base, length-16)^hashSeed2, readUint64(base, length-8)^hashSeed3)
 	return avalanche(acc)
+}
+
+func readUint32(base unsafe.Pointer, offset int) uint32 {
+	return *(*uint32)(unsafe.Add(base, offset))
 }
 
 func mix(left uint64, right uint64) uint64 {
@@ -60,10 +69,16 @@ func avalanche(value uint64) uint64 {
 }
 
 func readUint64(base unsafe.Pointer, offset int) uint64 {
-	bytes := unsafe.Slice((*byte)(unsafe.Add(base, offset)), 8)
-	return binary.LittleEndian.Uint64(bytes)
+	return *(*uint64)(unsafe.Add(base, offset))
 }
 
-func readByte(base unsafe.Pointer, offset int) byte {
-	return *(*byte)(unsafe.Add(base, offset))
+func hashInt64(seed uint64, key int64) uint64 {
+	return mix(seed^uint64(key)^hashSeed0, uint64(key)^hashSeed1)
+}
+
+func hashKey(seed uint64, k Key) uint64 {
+	if k.isInt {
+		return hashInt64(seed, k.i)
+	}
+	return hashString(seed, k.s)
 }

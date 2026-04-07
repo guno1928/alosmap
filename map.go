@@ -5,7 +5,7 @@ import (
 	"math/bits"
 	"runtime"
 	"slices"
-	"strings"
+	"strconv"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -30,35 +30,129 @@ type Option func(*config)
 
 type ValueCloneFunc func(value any) (cloned any, trackedBytes int64)
 
-// EntryOptions configures optional per-entry lifetime rules used by StoreWithOptions,
-// LoadOrStoreWithOptions, and SwapWithOptions.
+// EntryOptions defines optional per-entry lifecycle controls for write operations
+// such as StoreWithOptions, LoadOrStoreWithOptions, SwapWithOptions, and
+// CompareAndSwapWithOptions.
 //
-// All fields are optional. The zero value means the entry has no TTL and no hit
-// limit, so it remains available until it is overwritten, deleted, or removed by
-// some other operation.
+// EntryOptions is a configuration struct. All fields are optional, the zero value is
+// valid, and no field is required. When the zero value is used, the entry behaves
+// like a normal persistent map value: it has no time-based expiration, no hit limit,
+// and remains available until it is overwritten, explicitly deleted, cleared, or
+// removed by some other map operation.
 //
 // Field behavior:
 //
-// TTL is optional. Its default is 0. When TTL is greater than 0, the entry expires
-// that far in the future relative to the write that created or replaced it. When TTL
-// is 0 or negative, time-based expiry is disabled for that entry.
+// TTL controls time-based expiration. Default: 0. Optional: yes. Valid values: any
+// time.Duration. When TTL is greater than 0, the entry expires that far in the
+// future relative to the write that created or replaced it. When TTL is 0 or
+// negative, TTL-based expiration is disabled.
 //
-// Hits is optional. Its default is 0. When Hits is greater than 0, each successful
-// Load call decrements the remaining hit budget and the entry disappears after the
-// final allowed load. When Hits is 0 or negative, hit limiting is disabled and the
-// entry allows unlimited successful loads. Peek, Has, Range, and Snapshot do not
-// consume hits.
+// Hits controls read-count expiration for Load and Get. Default: 0. Optional: yes.
+// Valid values: any int64. When Hits is greater than 0, each successful Load or Get
+// decrements the remaining budget and the entry is removed after the final allowed
+// successful consuming read. When Hits is 0 or negative, hit limiting is disabled.
+// Peek, Has, Range, Snapshot, Stats, and Delete do not consume hits.
+//
+// TTL and Hits may be combined. In that case, the entry becomes unavailable as soon
+// as either limit is reached first.
 //
 // Example:
 //
-//	options := alosmap.EntryOptions{
-//		TTL:  30 * time.Second,
-//		Hits: 3,
+//	builder := alosmap.NewBuilder().
+//		Capacity(50_000).
+//		Shards(64).
+//		LoadFactor(0.80).
+//		CleanupInterval(2 * time.Second)
+//	cache := builder.Build()
+//	defer cache.Close()
+//
+//	sessionOptions := alosmap.EntryOptions{
+//		TTL:  30 * time.Minute,
+//		Hits: 5,
 //	}
-//	store.StoreWithOptions("session:123", "ready", options)
+//	cache.StoreWithOptions(alosmap.S("session:42"), []byte("ready"), sessionOptions)
+//
+//	value, ok := cache.Load(alosmap.S("session:42"))
+//	_ = value
+//	_ = ok
 type EntryOptions struct {
 	TTL  time.Duration
 	Hits int64
+}
+
+// Key represents a user-supplied map key.
+//
+// A Key can carry either a string or an int64 and is the only key type accepted by
+// Map. Construct keys with S for string values and I for int64 values. Key is a
+// small value type intended to be passed by value.
+type Key struct {
+	s     string
+	i     int64
+	isInt bool
+}
+
+// S constructs a Key from a string.
+//
+// Use S for natural application identifiers such as usernames, cache paths,
+// request IDs, or composite text keys.
+func S(key string) Key { return Key{s: key} }
+
+// I constructs a Key from an int64.
+//
+// Use I when numeric identifiers are already available in int64 form and you want
+// to avoid converting them to strings before accessing the map.
+func I(key int64) Key { return Key{i: key, isInt: true} }
+
+// String returns the human-readable form of the key.
+//
+// String returns the underlying string for string keys and the base-10 decimal
+// representation for int64 keys. It is intended for logging, debugging, and
+// diagnostic output.
+func (k Key) String() string {
+	if k.isInt {
+		return strconv.FormatInt(k.i, 10)
+	}
+	return k.s
+}
+
+// IsString reports whether the key was created from a string.
+func (k Key) IsString() bool { return !k.isInt }
+
+// IsInt64 reports whether the key was created from an int64.
+func (k Key) IsInt64() bool { return k.isInt }
+
+// StringVal returns the string payload of the key.
+//
+// For string keys, StringVal returns the original string. For int64 keys, it
+// returns the zero string. Use IsString when you need to distinguish those cases.
+func (k Key) StringVal() string { return k.s }
+
+// Int64Val returns the int64 payload of the key.
+//
+// For int64 keys, Int64Val returns the original integer. For string keys, it
+// returns 0. Use IsInt64 when you need to distinguish those cases.
+func (k Key) Int64Val() int64 { return k.i }
+
+// Raw returns the underlying key value as either a string or an int64.
+//
+// This is useful when generic logging, formatting, or adapter code needs the raw
+// user key without inspecting Key's internal representation directly.
+func (k Key) Raw() any {
+	if k.isInt {
+		return k.i
+	}
+	return k.s
+}
+
+func cloneKey(k Key) Key {
+	return k
+}
+
+func keySize(k Key) int64 {
+	if k.isInt {
+		return 8
+	}
+	return int64(len(k.s))
 }
 
 type MapCloner interface {
@@ -84,33 +178,72 @@ type config struct {
 
 // Builder incrementally configures a Map before construction.
 //
-// Builder provides a fluent alternative to functional options. Each setter records
-// the requested value and returns the same Builder so calls can be chained. Build
-// applies the same normalization rules as New, including default capacity,
-// auto-selected shard count, load-factor clamping, and cleanup interval handling.
+// Builder is a user-facing configuration struct for callers who prefer a fluent,
+// chainable setup style instead of passing functional options to New. Each setter
+// records a requested value and returns the same Builder so calls can be chained.
+// Build applies the same validation, normalization, and defaulting rules as New.
+//
+// Builder configuration fields:
+//
+// Capacity is optional. Default: 1024 expected live entries. Constraint: values less
+// than 1 are normalized to the default. Capacity influences initial allocation and
+// resize behavior only; it is not a hard maximum.
+//
+// Shards is optional. Default: automatic heuristic based on expected capacity and
+// GOMAXPROCS. Constraint: positive values are rounded up to the next power of two;
+// zero or negative values trigger automatic selection.
+//
+// LoadFactor is optional. Default: 0.72. Constraint: values below 0.50 are clamped
+// to 0.50 and values above 0.90 are clamped to 0.90.
+//
+// CleanupInterval is optional. Default: 5 seconds. Constraint: negative values are
+// normalized to 0. A value of 0 disables the background cleanup goroutine.
+//
+// ValueCloner is optional. Default: pass-through storage with zero tracked value
+// bytes. When provided, it is called at write time so mutable values can be cloned
+// before publication and approximate value memory can be recorded in Stats.
+//
+// Example:
+//
+//	cloneBytes := func(value any) (any, int64) {
+//		payload := value.([]byte)
+//		cloned := append([]byte(nil), payload...)
+//		return cloned, int64(len(cloned))
+//	}
+//
+//	cache := alosmap.NewBuilder().
+//		Capacity(250_000).
+//		Shards(128).
+//		LoadFactor(0.78).
+//		CleanupInterval(3 * time.Second).
+//		ValueCloner(cloneBytes).
+//		Build()
+//	defer cache.Close()
 type Builder struct {
 	cfg config
 }
 
-// Pair represents one key/value item returned by Snapshot.
+// Pair represents one key-value item returned by Snapshot.
 //
-// Snapshot returns a flat slice of Pair values so callers can inspect or copy a
-// point-in-time view of the map without holding references to internal tables.
+// Pair is primarily used when callers need a materialized slice view of the map for
+// further processing, sorting, copying, or serialization.
 type Pair struct {
-	Key   string
+	Key   Key
 	Value any
 }
 
-// Stats is a point-in-time snapshot of operational counters and size estimates for a Map.
+// Stats is a point-in-time snapshot of aggregated operational counters and size
+// estimates for a Map.
+//
+// Stats is observational data intended for monitoring, sizing, diagnostics, and
+// performance tuning. In concurrent programs the map may change again immediately
+// after Stats returns, so every field should be treated as approximate.
 //
 // Occupancy-related fields include Shards, SlotCapacity, LiveEntries, UsedSlots,
 // Tombstones, LoadFactor, and MaxShardLive. Maintenance-related fields include
 // ResizeCount, WriterSpins, CleanupRuns, CleanupSkips, ExpiredDeletes, and
 // HitDeletes. Memory-related fields include TrackedKeyBytes, TrackedValueBytes,
 // EstimatedOverheadBytes, and EstimatedResidentBytes.
-//
-// All values are observational. In a concurrent program they may change again
-// immediately after Stats returns.
 type Stats struct {
 	Shards                 int
 	SlotCapacity           int
@@ -131,18 +264,21 @@ type Stats struct {
 	MaxShardLive           int64
 }
 
-// Map is a concurrent string-key map optimized for high-throughput reads, mixed workloads,
-// and feature-rich entry lifecycle control.
+// Map is a concurrent map for string and int64 keys with lock-free reads for live
+// entries, sharded write coordination, and built-in entry lifecycle controls.
 //
-// Map stores values as any and publishes updates atomically so readers observe either
-// the old value or the new value, never a partially written state. Read operations on
-// live entries are lock-free. Write operations synchronize only within the shard that
-// owns the key, which allows unrelated keys to proceed in parallel.
+// Map is designed for high-throughput read-heavy and mixed workloads where callers
+// need more than a plain map or sync.Map, including conditional updates, TTL-based
+// expiration, hit-limited entries, background cleanup, snapshots, and lightweight
+// operational statistics.
 //
-// Each entry may optionally use a TTL, a hit limit, or both. Expired entries and
-// exhausted hit-limited entries are treated as absent. Values are stored by reference
-// unless a custom ValueCloneFunc is supplied, so storing a pointer returns that same
-// pointer from later loads.
+// Keys are supplied through Key values created with S or I. Values are stored as any.
+// By default the map stores the value exactly as supplied, including pointer values.
+// If you need copy-on-write behavior for mutable data, provide a ValueCloneFunc when
+// constructing the map.
+//
+// Map remains usable after Close. Close only stops the optional background cleanup
+// goroutine.
 type Map struct {
 	seed            uint64
 	shardMask       uint64
@@ -181,6 +317,7 @@ type shard struct {
 
 type table struct {
 	slots  []slot
+	ctrl   []byte
 	mask   uint64
 	growAt int
 }
@@ -190,10 +327,9 @@ type slot struct {
 }
 
 type entry struct {
-	hash     uint64
-	key      string
-	keyBytes int64
-	value    atomic.Pointer[valueBox]
+	hash  uint64
+	key   Key
+	value atomic.Pointer[valueBox]
 }
 
 type valueBox struct {
@@ -210,17 +346,17 @@ type entryBundle struct {
 
 // NewBuilder returns a Builder initialized with the package defaults.
 //
-// This is the fluent alternative to calling New with functional options directly.
-// Call the Builder methods you need and finish with Build.
+// Use NewBuilder when you want fluent map configuration instead of passing options
+// directly to New. The returned Builder starts with the same defaults that New uses.
 func NewBuilder() *Builder {
 	return &Builder{cfg: defaultConfig()}
 }
 
 // Capacity sets the expected live entry count used for initial sizing.
 //
-// Capacity is optional. When omitted, Build falls back to the package default of
-// 1024 expected entries. Values less than 1 are normalized to that same default.
-// Capacity is not a hard limit; it only guides the initial table size.
+// This setting is optional. When left unset, Build uses the default of 1024. Values
+// below 1 are normalized to that default. Capacity improves startup sizing and can
+// reduce early resizes, but it does not impose a maximum entry count.
 func (b *Builder) Capacity(capacity int) *Builder {
 	b.cfg.capacity = capacity
 	return b
@@ -228,9 +364,9 @@ func (b *Builder) Capacity(capacity int) *Builder {
 
 // Shards sets the requested shard count for the map.
 //
-// The requested value is normalized during Build. Values greater than 0 are rounded
-// up to the next power of two. Values less than or equal to 0 cause Build to use the
-// package's automatic shard-selection heuristic.
+// This setting is optional. Positive values are rounded up to the next power of two.
+// Zero and negative values tell Build to use the package's shard-selection heuristic.
+// More shards can reduce cross-key write contention at the cost of extra overhead.
 func (b *Builder) Shards(count int) *Builder {
 	b.cfg.shardCount = count
 	return b
@@ -238,8 +374,9 @@ func (b *Builder) Shards(count int) *Builder {
 
 // LoadFactor sets the target occupancy before a shard grows.
 //
-// LoadFactor is optional. When omitted, the default is 0.72. Values smaller than
-// 0.50 are clamped to 0.50, and values larger than 0.90 are clamped to 0.90.
+// This setting is optional. The default is 0.72. Values below 0.50 are clamped to
+// 0.50 and values above 0.90 are clamped to 0.90. Higher values trade memory for
+// denser tables; lower values trade space for shorter probe sequences.
 func (b *Builder) LoadFactor(loadFactor float64) *Builder {
 	b.cfg.loadFactor = loadFactor
 	return b
@@ -247,8 +384,10 @@ func (b *Builder) LoadFactor(loadFactor float64) *Builder {
 
 // CleanupInterval sets the cadence of the background cleanup goroutine.
 //
-// CleanupInterval is optional. The default is 5 seconds. A value of 0 disables the
-// background cleaner entirely. Negative values are normalized to 0 during Build.
+// This setting is optional. The default is 5 seconds. A value of 0 disables
+// background cleanup entirely. Negative values are normalized to 0 during Build.
+// Even when background cleanup is disabled, manual cleanup via CleanupNow remains
+// available.
 func (b *Builder) CleanupInterval(interval time.Duration) *Builder {
 	b.cfg.cleanupInterval = interval
 	return b
@@ -256,9 +395,10 @@ func (b *Builder) CleanupInterval(interval time.Duration) *Builder {
 
 // ValueCloner installs a custom write-time cloning function.
 //
-// By default the map stores values exactly as supplied. Providing a ValueCloner lets
-// you copy mutable values before publication and report an approximate byte size for
-// Stats. A nil cloner falls back to the default pass-through behavior.
+// This setting is optional. By default the map stores values exactly as supplied.
+// Provide a cloner when callers should never observe shared mutable state directly,
+// or when Stats should include tracked value bytes for stored objects. A nil cloner
+// falls back to the default pass-through behavior.
 func (b *Builder) ValueCloner(cloner ValueCloneFunc) *Builder {
 	b.cfg.cloneValue = cloner
 	return b
@@ -266,8 +406,9 @@ func (b *Builder) ValueCloner(cloner ValueCloneFunc) *Builder {
 
 // Build constructs a Map from the Builder configuration.
 //
-// Build applies the same normalization and defaulting rules as New, so the result is
-// identical to assembling the equivalent functional options manually.
+// Build applies the same defaults and normalization rules as New. Calling Build is
+// equivalent to translating the recorded Builder state into the corresponding option
+// list and passing that list to New.
 func (b *Builder) Build() *Map {
 	return New(
 		WithCapacity(b.cfg.capacity),
@@ -280,9 +421,9 @@ func (b *Builder) Build() *Map {
 
 // WithCapacity returns an Option that sets the expected live entry count for initial sizing.
 //
-// The default is 1024 when this option is omitted. Values less than 1 are normalized
-// to the default. Capacity influences initial allocation and resize behavior; it does
-// not enforce a maximum size.
+// The option is optional. The default is 1024 when it is omitted. Values below 1 are
+// normalized to that default. Capacity affects initial allocation and resize behavior,
+// but it does not enforce an upper bound on the number of entries.
 func WithCapacity(capacity int) Option {
 	return func(cfg *config) {
 		cfg.capacity = capacity
@@ -291,8 +432,8 @@ func WithCapacity(capacity int) Option {
 
 // WithShardCount returns an Option that sets the requested shard count.
 //
-// Positive values are rounded up to the next power of two. Zero or negative values
-// cause New to select a shard count automatically from the expected capacity.
+// The option is optional. Positive values are rounded up to the next power of two.
+// Zero and negative values cause New to choose the shard count automatically.
 func WithShardCount(count int) Option {
 	return func(cfg *config) {
 		cfg.shardCount = count
@@ -301,7 +442,8 @@ func WithShardCount(count int) Option {
 
 // WithLoadFactor returns an Option that sets the target occupancy before a shard grows.
 //
-// The default is 0.72. Values are clamped into the inclusive range [0.50, 0.90].
+// The option is optional. The default is 0.72. Values are clamped into the inclusive
+// range [0.50, 0.90].
 func WithLoadFactor(loadFactor float64) Option {
 	return func(cfg *config) {
 		cfg.loadFactor = loadFactor
@@ -310,8 +452,8 @@ func WithLoadFactor(loadFactor float64) Option {
 
 // WithCleanupInterval returns an Option that sets the background cleanup interval.
 //
-// The default is 5 seconds. A value of 0 disables background cleanup. Negative values
-// are normalized to 0.
+// The option is optional. The default is 5 seconds. A value of 0 disables background
+// cleanup. Negative values are normalized to 0.
 func WithCleanupInterval(interval time.Duration) Option {
 	return func(cfg *config) {
 		cfg.cleanupInterval = interval
@@ -320,7 +462,7 @@ func WithCleanupInterval(interval time.Duration) Option {
 
 // WithoutCleanup returns an Option that disables the background cleanup goroutine.
 //
-// This is equivalent to setting the cleanup interval to 0.
+// This is a convenience alias for WithCleanupInterval(0).
 func WithoutCleanup() Option {
 	return func(cfg *config) {
 		cfg.cleanupInterval = 0
@@ -329,8 +471,9 @@ func WithoutCleanup() Option {
 
 // WithValueCloner returns an Option that installs a custom write-time clone function.
 //
-// Use this when stored values should be copied before publication or when Stats should
-// track approximate cloned value sizes. A nil cloner falls back to pass-through storage.
+// Use this option when mutable values should be copied before publication or when
+// Stats should record approximate value memory for stored objects. A nil cloner falls
+// back to pass-through storage.
 func WithValueCloner(cloner ValueCloneFunc) Option {
 	return func(cfg *config) {
 		cfg.cloneValue = cloner
@@ -339,17 +482,18 @@ func WithValueCloner(cloner ValueCloneFunc) Option {
 
 // New constructs a Map from the provided options.
 //
-// Defaults used when options are omitted are:
+// All options are optional. When omitted, New uses these defaults:
 //
-//	Capacity: 1024 expected live entries
-//	Shard count: automatically selected from capacity and GOMAXPROCS
-//	Load factor: 0.72
-//	Cleanup interval: 5 seconds
-//	Value cloner: pass-through storage with zero tracked value bytes
+//	Capacity: 1024 expected live entries.
+//	Shard count: selected automatically from expected capacity and GOMAXPROCS.
+//	Load factor: 0.72.
+//	Cleanup interval: 5 seconds.
+//	Value cloner: pass-through storage with zero tracked value bytes.
 //
-// Options are normalized before construction. Capacity values below 1 fall back to
-// the default, shard counts are rounded to a power of two or auto-selected, load
-// factor is clamped to [0.50, 0.90], and negative cleanup intervals are treated as 0.
+// Option values are normalized before construction. Capacity values below 1 fall
+// back to the default, shard counts are rounded to a power of two or auto-selected,
+// load factor is clamped to [0.50, 0.90], and negative cleanup intervals are treated
+// as 0.
 func New(options ...Option) *Map {
 	cfg := defaultConfig()
 	for _, option := range options {
@@ -454,10 +598,10 @@ func autoShardCount(capacity int) int {
 	return floorPowerOfTwo(target)
 }
 
-// RecommendedShardCount returns the shard count heuristic used for a given expected capacity.
+// RecommendedShardCount returns the shard count heuristic for the supplied expected entry count.
 //
-// This is useful when you want to size the map explicitly but still reuse the package's
-// automatic shard-selection logic for large deployments.
+// Use this helper when you want to choose an explicit shard count but still follow
+// the package's built-in sizing heuristic. Values below 1 are treated as 1.
 func RecommendedShardCount(expectedEntries int) int {
 	if expectedEntries < 1 {
 		expectedEntries = 1
@@ -482,8 +626,9 @@ func (m *Map) cleanupLoop() {
 
 // Close stops the background cleanup goroutine, if one was started.
 //
-// Close is idempotent and safe to call multiple times. It does not invalidate the map;
-// it only disables automatic cleanup work running in the background.
+// Close is safe to call multiple times. It does not invalidate the map, clear any
+// entries, or prevent future reads and writes. Its only effect is stopping automatic
+// background cleanup.
 func (m *Map) Close() {
 	if m.stopCleanup == nil {
 		return
@@ -496,108 +641,229 @@ func (m *Map) Close() {
 
 // Store writes value at key using the default entry behavior.
 //
-// Store replaces any existing live value for the key. The new entry has no TTL and no
-// hit limit. Values are stored by reference unless a custom ValueCloneFunc is configured.
-func (m *Map) Store(key string, value any) {
-	m.StoreWithOptions(key, value, EntryOptions{})
+// Store creates or replaces the entry at key with no TTL and no hit limit. If the key
+// already exists, the previous live value is replaced. Unless the map was constructed
+// with a ValueCloneFunc, the supplied value is stored by reference exactly as given.
+func (m *Map) Store(key Key, value any) {
+	hash := hashKey(m.seed, key)
+	s := m.pickShard(hash)
+
+	var boxed *valueBox
+	if m.noClone {
+		boxed = &valueBox{value: value}
+	} else {
+		cloned, tracked := m.cloneValue(value)
+		boxed = &valueBox{value: cloned, clonedBytes: tracked}
+	}
+
+	currentTable := s.table.Load()
+	idx := int(hash & currentTable.mask)
+	fp := byte(hash>>56) | 1
+	ctrl := currentTable.ctrl
+	mask := int(currentTable.mask)
+	for probes := 0; probes <= mask; probes++ {
+		c := ctrl[idx]
+		if c == 0 {
+			break
+		}
+		if c == fp {
+			current := currentTable.slots[idx].entry.Load()
+			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				existing := current.value.Load()
+				if existing != nil && existing.expiresAt == 0 && existing.hits.Load() >= 0 {
+					if current.value.CompareAndSwap(existing, boxed) {
+						s.valueBytes.Add(boxed.clonedBytes - existing.clonedBytes)
+						return
+					}
+				}
+				break
+			}
+		}
+		idx = (idx + 1) & mask
+	}
+
+	s.store(hash, key, boxed)
 }
 
-// StoreWithTTL writes value at key and applies a TTL.
+// StoreWithTTL writes value at key and applies time-based expiration.
 //
-// When ttl is greater than 0, the entry expires relative to the time of this write.
-// When ttl is 0 or negative, the entry behaves like Store and has no time-based expiry.
-func (m *Map) StoreWithTTL(key string, value any, ttl time.Duration) {
+// When ttl is greater than 0, the entry expires that far in the future relative to
+// this write. When ttl is 0 or negative, the entry behaves like Store and does not
+// expire by time.
+func (m *Map) StoreWithTTL(key Key, value any, ttl time.Duration) {
 	m.StoreWithOptions(key, value, EntryOptions{TTL: ttl})
 }
 
 // StoreWithHits writes value at key and applies a hit limit.
 //
-// Hits greater than 0 allow that many successful Load calls before the entry is removed.
-// Hits equal to 0 or less disable hit limiting and allow unlimited successful loads.
-func (m *Map) StoreWithHits(key string, value any, hits int64) {
+// Hits greater than 0 allow that many successful consuming reads through Load or Get
+// before the entry is removed. Hits equal to 0 or less disable hit limiting.
+func (m *Map) StoreWithHits(key Key, value any, hits int64) {
 	m.StoreWithOptions(key, value, EntryOptions{Hits: hits})
 }
 
 // StoreWithTTLAndHits writes value at key with both TTL and hit-limit behavior.
 //
-// TTL and Hits follow the same rules documented by EntryOptions. Either control may
-// effectively be disabled by passing a non-positive value.
-func (m *Map) StoreWithTTLAndHits(key string, value any, ttl time.Duration, hits int64) {
+// TTL and Hits follow the same rules documented by EntryOptions. The entry becomes
+// unavailable when either limit is reached first.
+func (m *Map) StoreWithTTLAndHits(key Key, value any, ttl time.Duration, hits int64) {
 	m.StoreWithOptions(key, value, EntryOptions{TTL: ttl, Hits: hits})
 }
 
 // SetWithTTLAndHits writes value at key with both TTL and hit-limit behavior.
 //
-// It is provided as a naming alias for callers that prefer Set-style method names.
-// Its behavior is identical to StoreWithTTLAndHits.
-func (m *Map) SetWithTTLAndHits(key string, value any, ttl time.Duration, hits int64) {
+// This is a naming alias for StoreWithTTLAndHits for callers who prefer Set-style
+// API naming. Its behavior is identical.
+func (m *Map) SetWithTTLAndHits(key Key, value any, ttl time.Duration, hits int64) {
 	m.StoreWithTTLAndHits(key, value, ttl, hits)
 }
 
 // StoreWithOptions writes value at key and applies the supplied EntryOptions.
 //
-// This is the most general write API for creating or replacing an entry. The zero
-// value of EntryOptions gives the same behavior as Store.
-func (m *Map) StoreWithOptions(key string, value any, options EntryOptions) {
-	hash := hashString(m.seed, key)
+// This is the most general write API for creating or replacing a value. Passing the
+// zero value of EntryOptions produces the same behavior as Store.
+func (m *Map) StoreWithOptions(key Key, value any, options EntryOptions) {
+	hash := hashKey(m.seed, key)
 	boxed := m.newValueBox(value, options)
 	m.pickShard(hash).store(hash, key, boxed)
 }
 
 // Load returns the current live value for key.
 //
-// For hit-limited entries, each successful Load consumes one remaining hit. Expired
-// entries and exhausted hit-limited entries are treated as missing and return ok=false.
-func (m *Map) Load(key string) (any, bool) {
-	hash := hashString(m.seed, key)
-	return m.pickShard(hash).load(hash, key)
+// Load is the primary consuming read operation. For hit-limited entries, each
+// successful Load consumes one remaining hit. Expired entries and exhausted
+// hit-limited entries are treated as absent and return ok false.
+func (m *Map) Load(key Key) (any, bool) {
+	var hash uint64
+	if key.isInt {
+		hash = mix(m.seed^uint64(key.i)^hashSeed0, uint64(key.i)^hashSeed1)
+	} else {
+		hash = hashString(m.seed, key.s)
+	}
+
+	s := &m.shards[int((hash>>32)&m.shardMask)]
+
+	currentTable := s.table.Load()
+	index := int(hash & currentTable.mask)
+	fp := byte(hash>>56) | 1
+	ctrl := currentTable.ctrl
+	slots := currentTable.slots
+	mask := int(currentTable.mask)
+	for probes := 0; probes <= mask; probes++ {
+		c := ctrl[index]
+		if c == 0 {
+			return nil, false
+		}
+		if c == fp {
+			current := slots[index].entry.Load()
+			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				boxed := current.value.Load()
+				if boxed == nil {
+					return nil, false
+				}
+				if boxed.expiresAt == 0 {
+					hits := boxed.hits.Load()
+					if hits == 0 {
+						return boxed.value, true
+					}
+					if hits > 0 {
+						return s.readEntryConsumeHit(current, boxed)
+					}
+					if hits < 0 {
+						if s.clearIfMatch(current, boxed, false, true) {
+							s.maybeResize()
+						}
+						return nil, false
+					}
+					return boxed.value, true
+				}
+				return s.readEntrySlow(current, true)
+			}
+		}
+		index = (index + 1) & mask
+	}
+	return nil, false
 }
 
 // Get returns the current live value for key.
 //
-// Get is a naming alias for Load and therefore has identical behavior, including
-// hit consumption on successful reads of hit-limited entries.
-func (m *Map) Get(key string) (any, bool) {
+// Get is a naming alias for Load and has identical behavior, including hit
+// consumption for hit-limited entries.
+func (m *Map) Get(key Key) (any, bool) {
 	return m.Load(key)
 }
 
-// Peek returns the current live value for key without consuming hit counters.
+// Peek returns the current live value for key without consuming hits.
 //
-// Expired and exhausted entries are treated as absent in the same way as Load.
-func (m *Map) Peek(key string) (any, bool) {
-	hash := hashString(m.seed, key)
+// Peek is useful for inspection code that should not advance hit-limited entries.
+// Expired and exhausted entries are treated as absent, just as they are for Load.
+func (m *Map) Peek(key Key) (any, bool) {
+	hash := hashKey(m.seed, key)
 	return m.pickShard(hash).peek(hash, key)
 }
 
 // Has reports whether key currently resolves to a live entry.
 //
-// Has does not consume hit counters.
-func (m *Map) Has(key string) bool {
+// Has does not consume hits and is equivalent to discarding the value returned by
+// Peek.
+func (m *Map) Has(key Key) bool {
 	_, ok := m.Peek(key)
 	return ok
 }
 
 // Delete removes key and returns the previous live value when present.
 //
-// If the key is absent, expired, or already exhausted, Delete returns nil, false.
-func (m *Map) Delete(key string) (any, bool) {
-	hash := hashString(m.seed, key)
+// If the key is absent, expired, or already exhausted, Delete returns nil and false.
+func (m *Map) Delete(key Key) (any, bool) {
+	hash := hashKey(m.seed, key)
 	return m.pickShard(hash).delete(hash, key)
 }
 
 // LoadOrStore returns the existing live value for key or stores value when the key is absent.
 //
-// The inserted value uses the default entry behavior: no TTL and no hit limit.
-func (m *Map) LoadOrStore(key string, value any) (any, bool) {
-	return m.LoadOrStoreWithOptions(key, value, EntryOptions{})
+// When the key already resolves to a live entry, LoadOrStore returns that value and
+// loaded true. Otherwise it stores the supplied value with default behavior and
+// returns the stored value with loaded false.
+func (m *Map) LoadOrStore(key Key, value any) (any, bool) {
+	hash := hashKey(m.seed, key)
+	s := m.pickShard(hash)
+
+	currentTable := s.table.Load()
+	idx := int(hash & currentTable.mask)
+	fp := byte(hash>>56) | 1
+	ctrl := currentTable.ctrl
+	mask := int(currentTable.mask)
+	for probes := 0; probes <= mask; probes++ {
+		c := ctrl[idx]
+		if c == 0 {
+			break
+		}
+		if c == fp {
+			current := currentTable.slots[idx].entry.Load()
+			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				existing := current.value.Load()
+				if existing != nil && existing.expiresAt == 0 && existing.hits.Load() == 0 {
+					return existing.value, true
+				}
+				break
+			}
+		}
+		idx = (idx + 1) & mask
+	}
+
+	var cf ValueCloneFunc
+	if !m.noClone {
+		cf = m.cloneValue
+	}
+	return s.loadOrStoreDeferred(hash, key, value, EntryOptions{}, cf)
 }
 
 // LoadOrStoreWithOptions returns the existing live value for key or stores value with EntryOptions.
 //
 // If the current entry is expired or already exhausted, it is treated as absent and a
-// new entry may be installed.
-func (m *Map) LoadOrStoreWithOptions(key string, value any, options EntryOptions) (any, bool) {
-	hash := hashString(m.seed, key)
+// replacement may be installed using the supplied options.
+func (m *Map) LoadOrStoreWithOptions(key Key, value any, options EntryOptions) (any, bool) {
+	hash := hashKey(m.seed, key)
 	s := m.pickShard(hash)
 	var cf ValueCloneFunc
 	if !m.noClone {
@@ -608,48 +874,54 @@ func (m *Map) LoadOrStoreWithOptions(key string, value any, options EntryOptions
 
 // Swap atomically replaces the value for key and returns the previous live value when present.
 //
-// The replacement entry uses the default behavior of no TTL and no hit limit.
-func (m *Map) Swap(key string, value any) (any, bool) {
+// The replacement entry uses the default behavior of no TTL and no hit limit. If the
+// key was absent, Swap stores the new value and returns nil, false.
+func (m *Map) Swap(key Key, value any) (any, bool) {
 	return m.SwapWithOptions(key, value, EntryOptions{})
 }
 
 // SwapWithOptions atomically replaces the value for key and applies EntryOptions to the replacement.
 //
-// It returns the previous live value and true when a value existed, or nil and false
-// when the key was absent.
-func (m *Map) SwapWithOptions(key string, value any, options EntryOptions) (any, bool) {
-	hash := hashString(m.seed, key)
+// When a live value exists, SwapWithOptions returns that previous value with true.
+// When the key is absent, it installs the replacement and returns nil, false.
+func (m *Map) SwapWithOptions(key Key, value any, options EntryOptions) (any, bool) {
+	hash := hashKey(m.seed, key)
 	boxed := m.newValueBox(value, options)
 	return m.pickShard(hash).swap(hash, key, boxed)
 }
 
 // CompareAndSwap replaces the current value only when it matches oldValue.
 //
-// Value comparison uses the package's equality rules, including MapEqualer support and
-// special handling for several slice and map forms used by the implementation.
-func (m *Map) CompareAndSwap(key string, oldValue any, newValue any) bool {
+// Value comparison uses the package's equality rules, including MapEqualer support
+// and built-in handling for several slice and map forms. The replacement uses the
+// default entry behavior with no TTL and no hit limit.
+func (m *Map) CompareAndSwap(key Key, oldValue any, newValue any) bool {
 	return m.CompareAndSwapWithOptions(key, oldValue, newValue, EntryOptions{})
 }
 
-// CompareAndSwapWithOptions replaces the current value only when it matches oldValue and
-// applies EntryOptions to the replacement.
-func (m *Map) CompareAndSwapWithOptions(key string, oldValue any, newValue any, options EntryOptions) bool {
-	hash := hashString(m.seed, key)
+// CompareAndSwapWithOptions replaces the current value only when it matches oldValue and applies EntryOptions to the replacement.
+//
+// It returns true only when the key currently resolves to a live value and that value
+// compares equal to oldValue under the package's equality rules.
+func (m *Map) CompareAndSwapWithOptions(key Key, oldValue any, newValue any, options EntryOptions) bool {
+	hash := hashKey(m.seed, key)
 	boxed := m.newValueBox(newValue, options)
 	return m.pickShard(hash).compareAndSwap(hash, key, oldValue, boxed)
 }
 
 // CompareAndDelete removes key only when the current value matches oldValue.
 //
-// It returns true when the delete succeeds and false otherwise.
-func (m *Map) CompareAndDelete(key string, oldValue any) bool {
-	hash := hashString(m.seed, key)
+// It returns true when the key exists, resolves to a live value, and that value
+// compares equal to oldValue under the package's equality rules.
+func (m *Map) CompareAndDelete(key Key, oldValue any) bool {
+	hash := hashKey(m.seed, key)
 	return m.pickShard(hash).compareAndDelete(hash, key, oldValue)
 }
 
 // Len returns the current number of live entries.
 //
-// Len excludes deleted, expired, and exhausted entries.
+// Len excludes deleted entries, expired entries, and hit-limited entries that have
+// already been exhausted.
 func (m *Map) Len() int {
 	return int(m.len64())
 }
@@ -664,7 +936,8 @@ func (m *Map) len64() int64 {
 
 // Clear removes all keys from the map and resets shard tables toward their initial size.
 //
-// Clear does not stop the background cleaner and does not make the map unusable.
+// Clear keeps the map fully usable for future operations. It does not stop the
+// background cleaner and does not change the map's construction options.
 func (m *Map) Clear() {
 	for index := range m.shards {
 		m.shards[index].clear()
@@ -673,9 +946,8 @@ func (m *Map) Clear() {
 
 // CleanupNow forces an immediate maintenance pass across all shards.
 //
-// Cleanup removes expired entries, removes exhausted hit-limited entries, and may
-// compact or shrink shard tables when the implementation determines that rebuilding
-// would be beneficial.
+// CleanupNow removes expired entries, removes exhausted hit-limited entries, and may
+// rebuild shard tables to reclaim space or reduce tombstones.
 func (m *Map) CleanupNow() {
 	now := time.Now().UnixNano()
 	for index := range m.shards {
@@ -685,10 +957,10 @@ func (m *Map) CleanupNow() {
 
 // Range visits the current live entries in the map.
 //
-// Range does not consume hit counters. Iteration order is unspecified. When writes
-// happen concurrently, Range provides an eventually consistent view rather than a
-// locked snapshot. Returning false from visitor stops the iteration early.
-func (m *Map) Range(visitor func(key string, value any) bool) {
+// Range does not consume hits. Iteration order is unspecified. When concurrent writes
+// occur, Range provides an eventually consistent traversal rather than a locked
+// snapshot. Returning false from visitor stops iteration early.
+func (m *Map) Range(visitor func(key Key, value any) bool) {
 	for index := range m.shards {
 		currentShard := &m.shards[index]
 		currentTable := currentShard.table.Load()
@@ -710,11 +982,12 @@ func (m *Map) Range(visitor func(key string, value any) bool) {
 
 // Snapshot returns a flat slice containing the map's current live entries.
 //
-// Snapshot is built by calling Range and therefore has the same eventual-consistency
-// behavior under concurrent writes.
+// Snapshot is built from Range and therefore has the same eventual-consistency
+// behavior under concurrent writes. The returned slice is suitable for sorting,
+// copying, or further offline processing.
 func (m *Map) Snapshot() []Pair {
 	pairs := make([]Pair, 0, m.Len())
-	m.Range(func(key string, value any) bool {
+	m.Range(func(key Key, value any) bool {
 		pairs = append(pairs, Pair{Key: key, Value: value})
 		return true
 	})
@@ -723,8 +996,9 @@ func (m *Map) Snapshot() []Pair {
 
 // Stats returns a point-in-time snapshot of aggregated operational metrics.
 //
-// The returned counters and estimates are useful for sizing, observability, and
-// debugging. Because the map may be changing concurrently, the snapshot is approximate.
+// The returned values are useful for observability, sizing validation, benchmarking,
+// and debugging. Because the map may be changing concurrently, the snapshot is
+// approximate rather than transactional.
 func (m *Map) Stats() Stats {
 	stats := Stats{Shards: len(m.shards)}
 	for index := range m.shards {
@@ -780,7 +1054,7 @@ func (m *Map) pickShard(hash uint64) *shard {
 	return &m.shards[index]
 }
 
-func (s *shard) load(hash uint64, key string) (any, bool) {
+func (s *shard) load(hash uint64, key Key) (any, bool) {
 	currentTable := s.table.Load()
 	current := findEntry(currentTable, hash, key)
 	if current == nil {
@@ -789,7 +1063,7 @@ func (s *shard) load(hash uint64, key string) (any, bool) {
 	return s.readEntry(current, true)
 }
 
-func (s *shard) peek(hash uint64, key string) (any, bool) {
+func (s *shard) peek(hash uint64, key Key) (any, bool) {
 	currentTable := s.table.Load()
 	current := findEntry(currentTable, hash, key)
 	if current == nil {
@@ -799,6 +1073,55 @@ func (s *shard) peek(hash uint64, key string) (any, bool) {
 }
 
 func (s *shard) readEntry(current *entry, consumeHits bool) (any, bool) {
+	boxed := current.value.Load()
+	if boxed == nil {
+		return nil, false
+	}
+
+	if boxed.expiresAt == 0 {
+		hits := boxed.hits.Load()
+		if hits == 0 {
+			return boxed.value, true
+		}
+		if hits > 0 && consumeHits {
+			return s.readEntryConsumeHit(current, boxed)
+		}
+		if hits < 0 {
+			if s.clearIfMatch(current, boxed, false, true) {
+				s.maybeResize()
+			}
+			return nil, false
+		}
+		return boxed.value, true
+	}
+
+	return s.readEntrySlow(current, consumeHits)
+}
+
+func (s *shard) readEntryConsumeHit(current *entry, boxed *valueBox) (any, bool) {
+	for {
+		consumed, exhausted := boxed.consumeHit()
+		if !consumed {
+			if s.clearIfMatch(current, boxed, false, true) {
+				s.maybeResize()
+				return nil, false
+			}
+			boxed = current.value.Load()
+			if boxed == nil {
+				return nil, false
+			}
+			continue
+		}
+		value := boxed.value
+		if exhausted {
+			s.clearIfMatch(current, boxed, false, true)
+			s.maybeResize()
+		}
+		return value, true
+	}
+}
+
+func (s *shard) readEntrySlow(current *entry, consumeHits bool) (any, bool) {
 	for {
 		boxed := current.value.Load()
 		if boxed == nil {
@@ -842,7 +1165,7 @@ func (s *shard) readEntry(current *entry, consumeHits bool) (any, bool) {
 	}
 }
 
-func (s *shard) store(hash uint64, key string, boxed *valueBox) {
+func (s *shard) store(hash uint64, key Key, boxed *valueBox) {
 outer:
 	for {
 		s.beginWrite()
@@ -866,7 +1189,7 @@ outer:
 				continue outer
 			}
 
-			if current.hash == hash && current.key == key {
+			if current.hash == hash && keysEqual(current.key, key) {
 				s.replaceOrRevive(current, boxed)
 				resizeNeeded := s.shouldResizeWithTable(currentTable)
 				s.endWrite()
@@ -884,7 +1207,7 @@ outer:
 	}
 }
 
-func (s *shard) loadOrStore(hash uint64, key string, boxed *valueBox) (any, bool) {
+func (s *shard) loadOrStore(hash uint64, key Key, boxed *valueBox) (any, bool) {
 outer:
 	for {
 		s.beginWrite()
@@ -908,7 +1231,7 @@ outer:
 				continue outer
 			}
 
-			if current.hash == hash && current.key == key {
+			if current.hash == hash && keysEqual(current.key, key) {
 				actual, loaded := s.loadOrStoreCurrent(current, boxed)
 				resizeNeeded := !loaded && s.shouldResizeWithTable(currentTable)
 				s.endWrite()
@@ -925,24 +1248,29 @@ outer:
 		s.resize(int(s.live.Load()) + 1)
 	}
 }
-func (s *shard) loadOrStoreDeferred(hash uint64, key string, value any, options EntryOptions, cloneFunc ValueCloneFunc) (any, bool) {
+func (s *shard) loadOrStoreDeferred(hash uint64, key Key, value any, options EntryOptions, cloneFunc ValueCloneFunc) (any, bool) {
 	currentTable := s.table.Load()
 	idx := int(hash & currentTable.mask)
+	fp := fingerprint(hash)
 	emptyIdx := -1
-	for probes := 0; probes < len(currentTable.slots); probes++ {
-		current := currentTable.slots[idx].entry.Load()
-		if current == nil {
+	mask := int(currentTable.mask)
+	for probes := 0; probes <= mask; probes++ {
+		c := currentTable.ctrl[idx]
+		if c == 0 {
 			emptyIdx = idx
 			break
 		}
-		if current.hash == hash && current.key == key {
-			existing := current.value.Load()
-			if existing != nil && existing.expiresAt == 0 && existing.hits.Load() == 0 {
-				return existing.value, true
+		if c == fp {
+			current := currentTable.slots[idx].entry.Load()
+			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				existing := current.value.Load()
+				if existing != nil && existing.expiresAt == 0 && existing.hits.Load() == 0 {
+					return existing.value, true
+				}
+				break
 			}
-			break
 		}
-		idx = (idx + 1) & int(currentTable.mask)
+		idx = (idx + 1) & mask
 	}
 
 	if emptyIdx >= 0 {
@@ -955,8 +1283,7 @@ func (s *shard) loadOrStoreDeferred(hash uint64, key string, value any, options 
 		}
 		bundle := &entryBundle{}
 		bundle.ent.hash = hash
-		bundle.ent.key = strings.Clone(key)
-		bundle.ent.keyBytes = int64(len(key))
+		bundle.ent.key = cloneKey(key)
 		bundle.box.value = cloned
 		bundle.box.clonedBytes = trackedBytes
 		if options.Hits > 0 {
@@ -968,10 +1295,11 @@ func (s *shard) loadOrStoreDeferred(hash uint64, key string, value any, options 
 		bundle.ent.value.Store(&bundle.box)
 
 		if currentTable.slots[emptyIdx].entry.CompareAndSwap(nil, &bundle.ent) {
+			currentTable.ctrl[emptyIdx] = fp
 			if s.table.Load() == currentTable {
 				s.live.Add(1)
 				used := s.used.Add(1)
-				s.keyBytes.Add(bundle.ent.keyBytes)
+				s.keyBytes.Add(keySize(key))
 				if trackedBytes > 0 {
 					s.valueBytes.Add(trackedBytes)
 				}
@@ -992,12 +1320,13 @@ func (s *shard) loadOrStoreDeferred(hash uint64, key string, value any, options 
 	return s.loadOrStoreSlow(hash, key, value, options, cloneFunc)
 }
 
-func (s *shard) loadOrStoreSlow(hash uint64, key string, value any, options EntryOptions, cloneFunc ValueCloneFunc) (any, bool) {
+func (s *shard) loadOrStoreSlow(hash uint64, key Key, value any, options EntryOptions, cloneFunc ValueCloneFunc) (any, bool) {
 outer:
 	for {
 		s.beginWrite()
 		currentTable := s.table.Load()
 		index := int(hash & currentTable.mask)
+		fp := fingerprint(hash)
 
 		for probes := 0; probes < len(currentTable.slots); probes++ {
 			current := currentTable.slots[index].entry.Load()
@@ -1011,8 +1340,7 @@ outer:
 				}
 				bundle := &entryBundle{}
 				bundle.ent.hash = hash
-				bundle.ent.key = strings.Clone(key)
-				bundle.ent.keyBytes = int64(len(key))
+				bundle.ent.key = cloneKey(key)
 				bundle.box.value = cloned
 				bundle.box.clonedBytes = trackedBytes
 				if options.Hits > 0 {
@@ -1024,9 +1352,10 @@ outer:
 				bundle.ent.value.Store(&bundle.box)
 
 				if currentTable.slots[index].entry.CompareAndSwap(nil, &bundle.ent) {
+					currentTable.ctrl[index] = fp
 					s.live.Add(1)
 					used := s.used.Add(1)
-					s.keyBytes.Add(bundle.ent.keyBytes)
+					s.keyBytes.Add(keySize(key))
 					if trackedBytes > 0 {
 						s.valueBytes.Add(trackedBytes)
 					}
@@ -1044,7 +1373,7 @@ outer:
 				continue outer
 			}
 
-			if current.hash == hash && current.key == key {
+			if current.hash == hash && keysEqual(current.key, key) {
 				revive := false
 				for {
 					existing := current.value.Load()
@@ -1105,7 +1434,7 @@ outer:
 	}
 }
 
-func (s *shard) swap(hash uint64, key string, boxed *valueBox) (any, bool) {
+func (s *shard) swap(hash uint64, key Key, boxed *valueBox) (any, bool) {
 outer:
 	for {
 		s.beginWrite()
@@ -1129,7 +1458,7 @@ outer:
 				continue outer
 			}
 
-			if current.hash == hash && current.key == key {
+			if current.hash == hash && keysEqual(current.key, key) {
 				previous, loaded := s.replaceOrRevive(current, boxed)
 				resizeNeeded := s.shouldResizeWithTable(currentTable)
 				s.endWrite()
@@ -1147,7 +1476,7 @@ outer:
 	}
 }
 
-func (s *shard) delete(hash uint64, key string) (any, bool) {
+func (s *shard) delete(hash uint64, key Key) (any, bool) {
 	for {
 		s.beginWrite()
 		currentTable := s.table.Load()
@@ -1191,7 +1520,7 @@ func (s *shard) delete(hash uint64, key string) (any, bool) {
 			if current.value.CompareAndSwap(boxed, nil) {
 				s.live.Add(-1)
 				s.tombstones.Add(1)
-				s.keyBytes.Add(-current.keyBytes)
+				s.keyBytes.Add(-keySize(current.key))
 				s.valueBytes.Add(-boxed.clonedBytes)
 				s.needsCleanup.Store(true)
 				resizeNeeded := s.shouldResizeWithTable(currentTable)
@@ -1205,7 +1534,7 @@ func (s *shard) delete(hash uint64, key string) (any, bool) {
 	}
 }
 
-func (s *shard) compareAndSwap(hash uint64, key string, oldValue any, boxed *valueBox) bool {
+func (s *shard) compareAndSwap(hash uint64, key Key, oldValue any, boxed *valueBox) bool {
 	for {
 		s.beginWrite()
 		currentTable := s.table.Load()
@@ -1267,7 +1596,7 @@ func (s *shard) compareAndSwap(hash uint64, key string, oldValue any, boxed *val
 	}
 }
 
-func (s *shard) compareAndDelete(hash uint64, key string, oldValue any) bool {
+func (s *shard) compareAndDelete(hash uint64, key Key, oldValue any) bool {
 	for {
 		s.beginWrite()
 		currentTable := s.table.Load()
@@ -1316,7 +1645,7 @@ func (s *shard) compareAndDelete(hash uint64, key string, oldValue any) bool {
 			if current.value.CompareAndSwap(existing, nil) {
 				s.live.Add(-1)
 				s.tombstones.Add(1)
-				s.keyBytes.Add(-current.keyBytes)
+				s.keyBytes.Add(-keySize(current.key))
 				s.valueBytes.Add(-existing.clonedBytes)
 				s.needsCleanup.Store(true)
 				resizeNeeded := s.shouldResizeWithTable(currentTable)
@@ -1414,17 +1743,17 @@ func (s *shard) endWrite() {
 	s.state.Add(-1)
 }
 
-func (s *shard) insertFresh(currentTable *table, index int, hash uint64, key string, boxed *valueBox) (bool, bool, bool) {
+func (s *shard) insertFresh(currentTable *table, index int, hash uint64, key Key, boxed *valueBox) (bool, bool, bool) {
 	fresh := &entry{
-		hash:     hash,
-		key:      strings.Clone(key),
-		keyBytes: int64(len(key)),
+		hash: hash,
+		key:  cloneKey(key),
 	}
 	fresh.value.Store(boxed)
 	if currentTable.slots[index].entry.CompareAndSwap(nil, fresh) {
+		currentTable.ctrl[index] = fingerprint(hash)
 		s.live.Add(1)
 		used := s.used.Add(1)
-		s.keyBytes.Add(fresh.keyBytes)
+		s.keyBytes.Add(keySize(key))
 		if boxed.clonedBytes > 0 {
 			s.valueBytes.Add(boxed.clonedBytes)
 		}
@@ -1443,7 +1772,7 @@ func (s *shard) replaceOrRevive(current *entry, boxed *valueBox) (any, bool) {
 			if current.value.CompareAndSwap(nil, boxed) {
 				s.live.Add(1)
 				s.tombstones.Add(-1)
-				s.keyBytes.Add(current.keyBytes)
+				s.keyBytes.Add(keySize(current.key))
 				s.valueBytes.Add(boxed.clonedBytes)
 				if boxed.requiresCleanup() {
 					s.needsCleanup.Store(true)
@@ -1484,7 +1813,7 @@ func (s *shard) loadOrStoreCurrent(current *entry, boxed *valueBox) (any, bool) 
 			if current.value.CompareAndSwap(nil, boxed) {
 				s.live.Add(1)
 				s.tombstones.Add(-1)
-				s.keyBytes.Add(current.keyBytes)
+				s.keyBytes.Add(keySize(current.key))
 				s.valueBytes.Add(boxed.clonedBytes)
 				if boxed.requiresCleanup() {
 					s.needsCleanup.Store(true)
@@ -1516,7 +1845,7 @@ func (s *shard) clearIfMatch(current *entry, boxed *valueBox, expired bool, depl
 	if current.value.CompareAndSwap(boxed, nil) {
 		s.live.Add(-1)
 		s.tombstones.Add(1)
-		s.keyBytes.Add(-current.keyBytes)
+		s.keyBytes.Add(-keySize(current.key))
 		s.valueBytes.Add(-boxed.clonedBytes)
 		s.needsCleanup.Store(true)
 		if expired {
@@ -1599,7 +1928,7 @@ func (s *shard) resizeAt(minLiveEntries int, now int64, force bool) {
 			}
 		}
 		actualLive++
-		keyBytes += current.keyBytes
+		keyBytes += keySize(current.key)
 		valueBytes += boxed.clonedBytes
 	}
 
@@ -1698,25 +2027,59 @@ func (t *table) insertClone(current *entry) {
 	for {
 		if t.slots[index].entry.Load() == nil {
 			t.slots[index].entry.Store(current)
+			t.ctrl[index] = fingerprint(current.hash)
 			return
 		}
 		index = (index + 1) & int(t.mask)
 	}
 }
 
-func findEntry(currentTable *table, hash uint64, key string) *entry {
+func findEntry(currentTable *table, hash uint64, key Key) *entry {
 	index := int(hash & currentTable.mask)
-	for probes := 0; probes < len(currentTable.slots); probes++ {
-		current := currentTable.slots[index].entry.Load()
-		if current == nil {
+	fp := fingerprint(hash)
+	ctrl := currentTable.ctrl
+	slots := currentTable.slots
+	mask := int(currentTable.mask)
+	for probes := 0; probes <= mask; probes++ {
+		c := ctrl[index]
+		if c == 0 {
 			return nil
 		}
-		if current.hash == hash && current.key == key {
-			return current
+		if c == fp {
+			current := slots[index].entry.Load()
+			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				return current
+			}
 		}
-		index = (index + 1) & int(currentTable.mask)
+		index = (index + 1) & mask
 	}
 	return nil
+}
+
+func fingerprint(hash uint64) byte {
+	fp := byte(hash>>56) | 1
+	return fp
+}
+
+func keysEqual(a, b Key) bool {
+	if a.isInt != b.isInt {
+		return false
+	}
+	if a.isInt {
+		return a.i == b.i
+	}
+	if len(a.s) != len(b.s) {
+		return false
+	}
+	if len(a.s) == 0 {
+		return true
+	}
+	ap := unsafe.StringData(a.s)
+	bp := unsafe.StringData(b.s)
+	if ap == bp {
+		return true
+	}
+	return a.s == b.s
 }
 
 func newTableForEntries(entries int, loadFactor float64) *table {
@@ -1737,6 +2100,7 @@ func newTableWithSlots(slotCount int, loadFactor float64) *table {
 	}
 	return &table{
 		slots:  make([]slot, slotCount),
+		ctrl:   make([]byte, slotCount),
 		mask:   uint64(slotCount - 1),
 		growAt: growAt,
 	}
