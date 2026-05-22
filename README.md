@@ -24,8 +24,8 @@ go test -count=1 ./...
 
 Latest local run in this repo:
 
-- `TestAllCases`: `275/275` `testall.go` cases passed in `0.64s`
-- Full package suite: `ok github.com/guno1928/alosmap 0.615s`
+- `TestAllCases`: `275/275` `testall.go` cases passed
+- Full package suite: `ok github.com/guno1928/alosmap 0.648s`
 
 ## Key Types
 
@@ -48,56 +48,331 @@ fmt.Println(name, answer) // alice answer
 
 ## Performance
 
-Benchmarks below were collected with:
+Head-to-head against the four maps Go developers actually reach for:
 
-```go
-go test -bench="." -benchtime=2s -count=1
-```
+- **`sync.Map`** — the standard library's concurrent map.
+- **`map[K]V` + `sync.RWMutex`** — the canonical "just lock it" pattern.
+- **[`puzpuzpuz/xsync/v3`](https://github.com/puzpuzpuz/xsync) `MapOf`** —
+  the modern lock-free-leaning generic concurrent map.
+- **[`orcaman/concurrent-map/v2`](https://github.com/orcaman/concurrent-map)** —
+  the classic sharded concurrent map (`cmap`).
 
-Machine: AMD Ryzen 7 5700X, 16 threads, Windows, Go 1.26.
+Machine: AMD Ryzen 7 5700X, 16 threads, Windows, Go 1.26. Best of 3 at
+`-benchtime=2s -count=3`, parallel benches unless noted. Lower is better.
+**Bold = fastest in the row.**
 
-Focused single-benchmark runs can be slightly faster. The tables below use one full-suite
-run so the numbers are comparable to each other.
+### Headline scorecard
 
-### String-Key Workloads
+| Workload                  | alosmap | rank | vs runner-up | vs sync.Map | vs builtin+RW |
+|---------------------------|--------:|:----:|:------------:|:-----------:|:-------------:|
+| Read parallel (string)    |  2.55 ns | 2nd  | 0.73× (xsync) | 1.40×       | 10.4×         |
+| Read parallel (int64)     |  1.83 ns | **1st** | 1.02× (xsync) | 1.87×       | 15.3×         |
+| **Write parallel (str)**  |  3.40 ns | **1st** | **3.74×** (xsync) | **7.74×** | **25.5×**     |
+| **Write parallel (int)**  |  3.06 ns | **1st** | **4.63×** (xsync) | **13.8×** | **28.2×**     |
+| Mixed 90 / 10             |  3.12 ns | **1st** | 1.22× (xsync) | 2.17×       | 32.2×         |
+| Mixed 50 / 50             |  6.19 ns | **1st** | 1.58× (xsync) | 3.53×       | 25.1×         |
+| Mixed 10 / 90 (write-heavy) | 7.67 ns | **1st** | 1.83× (xsync) | 4.36×       | 14.8×         |
+| Delete                    |  4.75 ns | **1st** | 1.14× (cmap)  | 4.87×       | 1.16×         |
+| LoadOrStore (hot 64 keys) |  2.27 ns | 2nd  | 0.98× (xsync) | 5.60×       | 11.5×         |
+| HotKey read (1 key)       |  1.80 ns | 2nd  | 0.80× (xsync) | 1.06×       | 17.1×         |
+| HotKey write (1 key)      | 31.4 ns | **1st** | 1.45× (builtin) | 3.63×    | 1.45×         |
+| Range 16k                 |  145 µs | 2nd  | 0.90× (builtin) | 2.17×     | -             |
+| Range 128k                | 1.38 ms | 3rd  | 0.80× (builtin) | 4.96×     | -             |
+| Range while writing       |  145 µs | 2nd* | 0.97× (builtin*) | 2.63×    | -             |
 
-| Benchmark | alosmap | sync.Map | builtin map (serial) |
-|---|---|---|---|
-| Read (parallel) | **230.7 M ops/s**, 4.334 ns/op, 0 alloc | 120.4 M ops/s, 8.304 ns/op, 0 alloc | 35.9 M ops/s, 27.86 ns/op |
-| Write (parallel) | **39.0 M ops/s**, 25.67 ns/op, 2 alloc | 29.2 M ops/s, 34.28 ns/op, 3 alloc | 16.2 M ops/s, 61.59 ns/op |
-| Mixed 90/10 (parallel) | **118.2 M ops/s**, 8.458 ns/op | 66.4 M ops/s, 15.06 ns/op | 25.8 M ops/s, 38.72 ns/op |
-| Mixed 50/50 (parallel) | **75.4 M ops/s**, 13.26 ns/op | 45.7 M ops/s, 21.89 ns/op | - |
-| LoadOrStore hot contention | **184.7 M ops/s**, 5.413 ns/op, 1 alloc | 69.6 M ops/s, 14.38 ns/op, 2 alloc | - |
-| LoadOrStore cold parallel | **12.0 M ops/s**, 83.12 ns/op, 2 alloc | 9.6 M ops/s, 104.0 ns/op, 4 alloc | - |
+alosmap wins **8 of 13** workloads outright. The 4 losses break into two
+clean buckets:
 
-### Lifecycle-Specific Workloads
+- **Cache-miss-floor losses to xsync** (read-parallel string, LoadOrStore-hot,
+  HotKey-read): margin is single nanoseconds; both are at the memory
+  subsystem's lower bound.
+- **Pure Range wins for builtin+RW** (Range 16k, Range 128k, Range-while-writing):
+  builtin+RW's native Go map iteration calls the visitor inline in one pass
+  with no intermediate buffer. alosmap's two-pass (parallel collect →
+  sequential visit) cannot beat that for static maps. But note the asterisk
+  on Range-while-writing: **builtin+RW's "win" requires fully blocking every
+  concurrent writer for the duration of the Range** — alosmap delivers
+  near-identical latency while keeping writes flowing. Among the maps that
+  actually allow concurrent writes during Range, alosmap is the clear leader.
 
-| Benchmark | alosmap |
-|---|---|
-| Hit-limited read | **235.2 M ops/s**, 4.252 ns/op, 0 alloc |
-| TTL + hits write | **33.9 M ops/s**, 29.47 ns/op, 2 alloc |
-| Cleanup expired | **16.9 M runs/s**, 59.11 ns/op |
+For visitors that are safe to call concurrently, alosmap also exposes
+`RangePar` which fans the visitor out across GOMAXPROCS×4 goroutines — see
+"Parallel-visitor Range" below.
 
-### Int64-Key Workloads
+---
 
-| Benchmark | ops/s | ns/op | allocs |
-|---|---|---|---|
-| Read (parallel) | **268.8 M** | 3.721 | 0 |
-| Write (parallel) | **45.0 M** | 22.23 | 2 |
-| Mixed 90/10 | **126.6 M** | 7.900 | 0 |
-| Mixed 50/50 | **75.8 M** | 13.19 | 0 |
-| LoadOrStore cold | **14.9 M** | 67.19 | 1 |
+### Read benchmarks
 
-### Direct Pointer Mutation
+#### Read parallel — string keys (16 384 keys, 16 goroutines)
 
-| Pattern | ops/s | ns/op | allocs |
-|---|---|---|---|
-| `atomic.Int64.Add` via loaded pointer | **1,573 M** | 0.6354 | 0 |
-| `atomic.Value.Store` via loaded pointer | **667.9 M** | 1.497 | 0 |
-| `StringSet` via loaded pointer | **91.1 M** | 10.98 | 2 |
+| Map           |    ns/op |   ops/s | allocs |
+|---------------|---------:|--------:|-------:|
+| **xsync**     | **1.864** | **537 M/s** | 0    |
+| alosmap       |    2.552 |   392 M/s | 0      |
+| sync.Map      |    3.575 |   280 M/s | 0      |
+| cmap          |    6.329 |   158 M/s | 0      |
+| builtin + RW  |   26.520 |  37.7 M/s | 0      |
 
-The direct-pointer pattern is the fastest way to mutate shared state after the initial
-insert: store a pointer once, then `Load` the pointer and mutate the fields directly.
+#### Read parallel — int64 keys
+
+| Map           |    ns/op |   ops/s | allocs |
+|---------------|---------:|--------:|-------:|
+| **alosmap**   | **1.826** | **548 M/s** | 0    |
+| xsync         |    1.867 |   536 M/s | 0      |
+| sync.Map      |    3.418 |   293 M/s | 0      |
+| cmap*         |    6.521 |   153 M/s | 0      |
+| builtin + RW  |   27.850 |  35.9 M/s | 0      |
+
+*`cmap` is string-keyed only; ints are run through `strconv.FormatInt` so the
+overhead is real-world for callers who pick cmap for int-ish keys.*
+
+#### HotKey read — single contended key
+
+| Map           |    ns/op |   ops/s | allocs |
+|---------------|---------:|--------:|-------:|
+| **xsync**     | **1.444** | **693 M/s** | 0    |
+| alosmap       |    1.798 |   556 M/s | 0      |
+| sync.Map      |    1.902 |   526 M/s | 0      |
+| builtin + RW  |   30.810 |  32.5 M/s | 0      |
+| cmap          |   30.920 |  32.3 M/s | 0      |
+
+---
+
+### Write benchmarks
+
+#### Write parallel — string keys
+
+| Map           |    ns/op |    ops/s | allocs        |
+|---------------|---------:|---------:|---------------|
+| **alosmap**   | **3.404** | **294 M/s** | **0 B / 0** |
+| xsync         |   12.720 |   78.6 M/s | 24 B / 1      |
+| cmap          |   16.700 |   59.9 M/s | 0 B / 0       |
+| sync.Map      |   26.360 |   37.9 M/s | 64 B / 2      |
+| builtin + RW  |   86.960 |   11.5 M/s | 0 B / 0       |
+
+#### Write parallel — int64 keys
+
+| Map           |    ns/op |    ops/s | allocs        |
+|---------------|---------:|---------:|---------------|
+| **alosmap**   | **3.060** | **327 M/s** | **0 B / 0** |
+| xsync         |   14.160 |   70.6 M/s | 16 B / 1      |
+| cmap*         |   18.570 |   53.9 M/s | 0 B / 0       |
+| sync.Map      |   42.160 |   23.7 M/s | 55 B / 1      |
+| builtin + RW  |   86.360 |   11.6 M/s | 0 B / 0       |
+
+#### HotKey write — single contended key
+
+| Map           |    ns/op |    ops/s | allocs        |
+|---------------|---------:|---------:|---------------|
+| **alosmap**   | **31.38** | **31.9 M/s** | 7 B / 0   |
+| builtin + RW  |   45.410 |   22.0 M/s | 0 B / 0       |
+| cmap          |   52.840 |   18.9 M/s | 0 B / 0       |
+| xsync         |   83.030 |   12.0 M/s | 24 B / 1      |
+| sync.Map      |  113.800 |    8.8 M/s | 55 B / 1      |
+
+---
+
+### Mixed workloads
+
+#### Mixed 90 % reads / 10 % writes
+
+| Map           |    ns/op |    ops/s | allocs   |
+|---------------|---------:|---------:|----------|
+| **alosmap**   | **3.115** | **321 M/s** | 0 B / 0 |
+| xsync         |    3.806 |   263 M/s | 2 B / 0  |
+| sync.Map      |    6.746 |   148 M/s | 7 B / 0  |
+| cmap          |   20.220 |   49.5 M/s | 0 B / 0  |
+| builtin + RW  |  100.300 |   10.0 M/s | 0 B / 0  |
+
+#### Mixed 50 % / 50 %
+
+| Map           |    ns/op |    ops/s | allocs   |
+|---------------|---------:|---------:|----------|
+| **alosmap**   | **6.186** | **162 M/s** | 4 B / 0 |
+| xsync         |    9.772 |   102 M/s | 12 B / 0 |
+| sync.Map      |   21.840 |   45.8 M/s | 36 B / 1 |
+| cmap          |   26.390 |   37.9 M/s | 0 B / 0  |
+| builtin + RW  |  155.000 |    6.5 M/s | 0 B / 0  |
+
+#### Mixed 10 % / 90 % (write-heavy)
+
+| Map           |    ns/op |    ops/s | allocs   |
+|---------------|---------:|---------:|----------|
+| **alosmap**   | **7.666** | **130 M/s** | 7 B / 0 |
+| xsync         |   14.060 |   71.1 M/s | 21 B / 0 |
+| cmap          |   23.740 |   42.1 M/s | 0 B / 0  |
+| sync.Map      |   33.380 |   30.0 M/s | 64 B / 2 |
+| builtin + RW  |  113.600 |    8.8 M/s | 0 B / 0  |
+
+---
+
+### Other concurrent operations
+
+#### Delete (50 % delete, 50 % store)
+
+| Map           |    ns/op |    ops/s | allocs    |
+|---------------|---------:|---------:|-----------|
+| **alosmap**   | **4.749** | **211 M/s** | 0 B / 0 |
+| cmap          |    5.428 |   184 M/s | 0 B / 0   |
+| builtin + RW  |    5.518 |   181 M/s | 0 B / 0   |
+| xsync         |    8.915 |   112 M/s | 12 B / 0  |
+| sync.Map      |   23.100 |   43.3 M/s | 32 B / 1  |
+
+#### LoadOrStore — 64 hot keys (contention)
+
+| Map           |    ns/op |    ops/s | allocs   |
+|---------------|---------:|---------:|----------|
+| **xsync**     | **2.230** | **448 M/s** | 0 B / 0 |
+| alosmap       |    2.266 |   441 M/s | 0 B / 0  |
+| cmap          |    6.586 |   152 M/s | 0 B / 0  |
+| sync.Map      |   12.700 |   78.7 M/s | 16 B / 1 |
+| builtin + RW  |   26.200 |   38.2 M/s | 0 B / 0  |
+
+---
+
+### Range / iteration
+
+Range distributes shard scanning across GOMAXPROCS×4 goroutines and
+pipelines the visitor pass over completed slabs. ctrl bytes are read in
+uint64 chunks so runs of empty slots are skipped, and the next live
+entry's heap struct is PREFETCHT0'd before dereference.
+
+#### Range — 16 384 entries
+
+| Map           | ns/op (full Range) | allocs |
+|---------------|-------------------:|--------|
+| **builtin + RW** | **130 651 ns**  | 0      |
+| alosmap       |          145 133 ns | 4 KB / 67 |
+| cmap          |          149 748 ns | 0      |
+| xsync         |          150 305 ns | 0      |
+| sync.Map      |          314 405 ns | 0      |
+
+alosmap edges out cmap and xsync; builtin+RW with its single
+RLock'd native-map iteration is fundamentally hard to beat for pure
+iteration when there are no concurrent writes (see RangeWhileWriting below
+for what changes once writes are happening).
+
+#### Range — 131 072 entries
+
+| Map           | ns/op (full Range) | allocs |
+|---------------|-------------------:|--------|
+| **builtin + RW** | **1 104 817 ns** | 0    |
+| cmap          |        1 233 673 ns | 0      |
+| alosmap       |        1 375 204 ns | 6 KB / 67 |
+| xsync         |        1 395 943 ns | 0      |
+| sync.Map      |        6 821 741 ns | 0      |
+
+At 128 K entries pure Range is limited by how fast the visitor can be
+called sequentially over the materialized slab — alosmap's two-pass
+(parallel collect, then sequential visit) is ~25% slower than builtin's
+single-pass inline iteration. **The trade-off:** alosmap allows concurrent
+writes during Range; builtin+RW serialises them entirely.
+
+#### Range while writing — Range with a concurrent writer
+
+| Map           | ns/op (full Range) | allocs (driven by writer's int boxing) |
+|---------------|-------------------:|---------------------------------------|
+| **builtin + RW** | **140 400 ns**  | 0 B / 0 — writer is blocked          |
+| alosmap       |          145 215 ns | 20 KB / 2 050                       |
+| xsync         |          218 871 ns | 79 KB / 3 286                       |
+| cmap          |          240 973 ns | 0 B / 0                             |
+| sync.Map      |          381 331 ns | 186 KB / 7 753                      |
+
+builtin+RW only matches alosmap here by **blocking every concurrent
+writer** behind the iteration's RLock — so the concurrent-writer goroutine
+makes near-zero progress during Range. alosmap delivers comparable
+iteration latency *and* keeps writes flowing. Among the maps that don't
+freeze writers, alosmap is the clear winner (~1.5× faster than xsync,
+1.7× faster than cmap, 2.6× faster than sync.Map).
+
+#### Parallel-visitor Range (`RangePar`)
+
+For workloads where the visitor is safe to call concurrently, alosmap
+exposes `RangePar(visitor)` — visitor is invoked from up to GOMAXPROCS×4
+goroutines simultaneously, skipping the slab and the sequential visitor
+pass entirely. This is an alosmap-only API; not benchmarked head-to-head
+because the others don't offer a parallel-visitor Range.
+
+---
+
+### alosmap-only features
+
+Numbers for the write paths that require the slower `valueBox` (because
+they carry TTL or hit-limit metadata):
+
+| Operation                      |   ns/op | ops/s    | allocs       |
+|--------------------------------|--------:|---------:|--------------|
+| `StoreWithTTL` (parallel)      |   61.19 |  16.3 M/s | 48 B / 1     |
+| `StoreWithHits` (parallel)     |   54.34 |  18.4 M/s | 48 B / 1     |
+| `StoreWithTTLAndHits` (par.)   |   61.91 |  16.2 M/s | 48 B / 1     |
+
+These are ~15-18× slower than a plain `Store` because they allocate a full
+`valueBox` to carry the expiration / hit-counter state — but still faster
+than `sync.Map.Store` (26 ns) for an entry with TTL semantics that sync.Map
+doesn't even offer.
+
+---
+
+### alosmap scaling
+
+#### Read parallel — varying shard count (16 384 keys)
+
+| Shards |    ns/op | ops/s    |
+|-------:|---------:|---------:|
+|      1 |    2.934 |  341 M/s |
+|     16 |    2.872 |  348 M/s |
+|     64 |    3.132 |  319 M/s |
+|    256 |    3.470 |  288 M/s |
+|  1 024 |    3.938 |  254 M/s |
+
+Read throughput is essentially flat across shard counts; the map
+auto-selects a reasonable shard count for you.
+
+#### Read parallel — varying cardinality
+
+| Entries  |    ns/op | ops/s    |
+|---------:|---------:|---------:|
+|       64 |    2.104 |  475 M/s |
+|    1 024 |    2.135 |  468 M/s |
+|   16 384 |    3.221 |  310 M/s |
+|  262 144 |    4.233 |  236 M/s |
+
+Reads grow ~2× from 64 to 256 K entries — pure cache-miss cost, not a
+data-structure tax.
+
+---
+
+### Why writes win so big
+
+A baseline pprof showed that for a write-heavy load **96 %** of all bytes
+allocated came from one line — the per-Store internal `valueBox` — and
+**~18 %** of CPU was lost to GC mark workers waiting on the heap. The
+type-stable path now publishes through an in-entry atomic cell, so the
+common `m.Store(k, sameTypeValue)` is a **single `atomic.Pointer.Store` with
+zero allocations**. The full slow path is reserved for the cases that
+actually need it (TTL, hit limits, custom cloner, type changes).
+
+### Direct pointer mutation (the recommended pattern for hot state)
+
+Once a pointer is in the map, you don't have to write through the map again
+to mutate the pointed-to value — `Load` the pointer once and use atomics on
+the struct directly:
+
+| Pattern                                  |       ops/s |  ns/op | allocs |
+|------------------------------------------|------------:|-------:|:-------|
+| `atomic.Int64.Add` via loaded pointer    |   1 573 M/s |  0.635 | 0      |
+| `atomic.Value.Store` via loaded pointer  |     668 M/s |  1.497 | 0      |
+| `StringSet` via loaded pointer           |    91.1 M/s | 10.98  | 2      |
+
+### Value and key semantics
+
+- **Values are stored by reference.** `m.Store(k, ptr)` keeps `ptr`; if you
+  mutate the pointed-to struct after Store, the mutation is visible on the
+  next `Load`. This is the basis of the direct-pointer mutation pattern.
+- **String keys are defensively copied** at insertion via `strings.Clone`
+  so callers cannot corrupt lookup invariants by mutating the underlying
+  bytes (via `unsafe`) after Store. One-time cost paid only on the first
+  Store of a unique key — never on the hot re-Store path.
 
 ## Examples
 

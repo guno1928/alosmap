@@ -3,9 +3,12 @@ package alosmap
 import (
 	"math"
 	"math/bits"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -144,8 +147,18 @@ func (k Key) Raw() any {
 	return k.s
 }
 
+// cloneKey returns a Key whose contents are safe from caller mutation. For int64
+// keys this is a no-op (values are copied by Go's calling convention). For string
+// keys we force-allocate a fresh string via strings.Clone so callers cannot
+// mutate the underlying bytes via unsafe operations after Store — that would
+// otherwise corrupt the hash/lookup invariants (we'd hash one set of bytes at
+// insert time and a different set at probe time). Values are NOT cloned: they
+// continue to be stored by reference so users can mutate them after Store.
 func cloneKey(k Key) Key {
-	return k
+	if k.isInt {
+		return k
+	}
+	return Key{s: strings.Clone(k.s)}
 }
 
 func keySize(k Key) int64 {
@@ -330,7 +343,21 @@ type entry struct {
 	hash  uint64
 	key   Key
 	value atomic.Pointer[valueBox]
+
+	// cellTyp / cellData publish a simple stored value's interface words.
+	// When cellTyp != 0 the cell is authoritative for readers; valueBox is
+	// consulted only for TTL/hits/clonedBytes metadata or when the cell is
+	// invalidated (cellTyp == 0). atomic.Pointer.Store on cellData engages
+	// Go's writebarrier so the GC traces the data pointer correctly.
+	//
+	// Type-stable repeat Stores (the hot case `m.Store(k, 1)` where the
+	// concrete type never changes) update only cellData — zero allocation.
+	// Type changes, TTL/hits Stores, and Delete go through the slow path,
+	// invalidating the cell first via cellTyp.Store(0).
+	cellTyp  atomic.Uintptr
+	cellData atomic.Pointer[byte]
 }
+
 
 type valueBox struct {
 	value       any
@@ -567,7 +594,7 @@ func (cfg *config) normalize() {
 	}
 	if cfg.cloneValue == nil {
 		cfg.cloneValue = defaultCloneValue
-	} else {
+	} else if reflect.ValueOf(cfg.cloneValue).Pointer() != reflect.ValueOf(defaultCloneValue).Pointer() {
 		cfg.hasCustomCloner = true
 	}
 }
@@ -648,6 +675,42 @@ func (m *Map) Store(key Key, value any) {
 	hash := hashKey(m.seed, key)
 	s := m.pickShard(hash)
 
+	// Fast probe path: when the map has no custom cloner and there is already
+	// a live entry whose published cell type matches the new value's type, we
+	// can publish the new value with a single atomic.Pointer.Store on cellData
+	// (no allocation, GC writebarrier handled by atomic.Pointer).
+	if m.noClone {
+		newTyp, newData := ifaceWords(value)
+		currentTable := s.table.Load()
+		idx := int(hash & currentTable.mask)
+		fp := byte(hash>>56) | 1
+		ctrl := currentTable.ctrl
+		mask := int(currentTable.mask)
+		for probes := 0; probes <= mask; probes++ {
+			c := ctrl[idx]
+			if c == 0 {
+				break
+			}
+			if c == fp {
+				current := currentTable.slots[idx].entry.Load()
+				if current != nil && current.hash == hash && keysEqual(current.key, key) {
+					if current.cellTyp.Load() == newTyp && newTyp != 0 {
+						existing := current.value.Load()
+						if existing != nil && existing.expiresAt == 0 && existing.clonedBytes == 0 && existing.hits.Load() == 0 {
+							current.cellData.Store((*byte)(newData))
+							return
+						}
+					}
+					break
+				}
+			}
+			idx = (idx + 1) & mask
+		}
+	}
+
+	// Slow path: allocate a valueBox, CAS-replace any existing one (or insert
+	// fresh), and re-prime the cell with the new (typ, data) at the end so
+	// subsequent same-type Stores hit the fast path again.
 	var boxed *valueBox
 	if m.noClone {
 		boxed = &valueBox{value: value}
@@ -671,8 +734,12 @@ func (m *Map) Store(key Key, value any) {
 			if current != nil && current.hash == hash && keysEqual(current.key, key) {
 				existing := current.value.Load()
 				if existing != nil && existing.expiresAt == 0 && existing.hits.Load() >= 0 {
+					// Invalidate cell before swapping valueBox so concurrent
+					// readers bail to the valueBox path during the change.
+					current.cellTyp.Store(0)
 					if current.value.CompareAndSwap(existing, boxed) {
 						s.valueBytes.Add(boxed.clonedBytes - existing.clonedBytes)
+						current.primeCell(boxed)
 						return
 					}
 				}
@@ -757,6 +824,14 @@ func (m *Map) Load(key Key) (any, bool) {
 		if c == fp {
 			current := slots[index].entry.Load()
 			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				// Cell fast path: cellTyp.Load() acquire-pairs with the
+				// writer's cellTyp.Store(release). If we see a non-zero typ,
+				// cellData.Load returns the data that was stored before typ
+				// was published.
+				if t := current.cellTyp.Load(); t != 0 {
+					d := current.cellData.Load()
+					return ifaceFromWords(t, unsafe.Pointer(d)), true
+				}
 				boxed := current.value.Load()
 				if boxed == nil {
 					return nil, false
@@ -961,23 +1036,136 @@ func (m *Map) CleanupNow() {
 // occur, Range provides an eventually consistent traversal rather than a locked
 // snapshot. Returning false from visitor stops iteration early.
 func (m *Map) Range(visitor func(key Key, value any) bool) {
-	for index := range m.shards {
-		currentShard := &m.shards[index]
-		currentTable := currentShard.table.Load()
-		for slotIndex := range currentTable.slots {
-			current := currentTable.slots[slotIndex].entry.Load()
-			if current == nil {
-				continue
+	n := len(m.shards)
+	if n == 1 {
+		rangeShardSequential(&m.shards[0], visitor)
+		return
+	}
+
+	// Estimate total live entries to decide parallel strategy.
+	var totalLive int64
+	for i := range m.shards {
+		totalLive += m.shards[i].live.Load()
+	}
+	if totalLive < parallelRangeThreshold {
+		for i := range m.shards {
+			if !rangeShardSequential(&m.shards[i], visitor) {
+				return
 			}
-			value, ok := currentShard.readEntry(current, false)
-			if !ok {
-				continue
-			}
-			if !visitor(current.key, value) {
+		}
+		return
+	}
+
+	// Pick worker count adaptively. Spawning one goroutine per shard wastes
+	// thousands of spawns on big maps; bounding to GOMAXPROCS makes each worker
+	// blow past L2 and become memory-bandwidth-bound. Empirically GOMAXPROCS×4
+	// goroutines, each handling a contiguous chunk of shards, hits the sweet
+	// spot: per-worker working set fits in L2 and Go's scheduler keeps the
+	// cores saturated.
+	procs := runtime.GOMAXPROCS(0)
+	workers := procs * 4
+	if workers > n {
+		workers = n
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	slabs := acquireRangeSlabs(workers)
+	defer releaseRangeSlabs(slabs)
+	ready := acquireRangeReady(workers)
+	defer releaseRangeReady(ready)
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	base := n / workers
+	extra := n % workers
+	start := 0
+	for w := 0; w < workers; w++ {
+		count := base
+		if w < extra {
+			count++
+		}
+		end := start + count
+		workerIdx := w
+		shardSlice := m.shards[start:end]
+		go rangeWorkerPipeline(shardSlice, &slabs[workerIdx], &ready[workerIdx], &wg)
+		start = end
+	}
+
+	for w := 0; w < workers; w++ {
+		for !ready[w].Load() {
+			runtime.Gosched()
+		}
+		slab := slabs[w]
+		for i := range slab {
+			p := &slab[i]
+			if !visitor(p.key, p.value) {
+				wg.Wait()
 				return
 			}
 		}
 	}
+	wg.Wait()
+}
+
+// RangePar is like Range but visits entries from multiple goroutines in
+// parallel. The supplied visitor MUST be safe to call concurrently — protect
+// any shared state with atomics, channels, or a mutex. In return, RangePar
+// scales with GOMAXPROCS and outperforms every sequential-visitor map for
+// large iterations.
+//
+// Visitor returning false signals "stop"; in-flight workers will exit at
+// their next slot boundary, but a small number of additional calls may still
+// be made before all workers observe the stop. Do not rely on the exact
+// total of visitor invocations after returning false.
+//
+// Iteration order is undefined.
+func (m *Map) RangePar(visitor func(key Key, value any) bool) {
+	n := len(m.shards)
+	if n == 1 {
+		rangeShardSequential(&m.shards[0], visitor)
+		return
+	}
+
+	var totalLive int64
+	for i := range m.shards {
+		totalLive += m.shards[i].live.Load()
+	}
+	if totalLive < parallelRangeThreshold {
+		for i := range m.shards {
+			if !rangeShardSequential(&m.shards[i], visitor) {
+				return
+			}
+		}
+		return
+	}
+
+	procs := runtime.GOMAXPROCS(0)
+	workers := procs * 4
+	if workers > n {
+		workers = n
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	var stopped atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	base := n / workers
+	extra := n % workers
+	start := 0
+	for w := 0; w < workers; w++ {
+		count := base
+		if w < extra {
+			count++
+		}
+		end := start + count
+		go rangeWorkerDirect(m.shards[start:end], visitor, &stopped, &wg)
+		start = end
+	}
+	wg.Wait()
 }
 
 // Snapshot returns a flat slice containing the map's current live entries.
@@ -1073,6 +1261,10 @@ func (s *shard) peek(hash uint64, key Key) (any, bool) {
 }
 
 func (s *shard) readEntry(current *entry, consumeHits bool) (any, bool) {
+	if t := current.cellTyp.Load(); t != 0 {
+		d := current.cellData.Load()
+		return ifaceFromWords(t, unsafe.Pointer(d)), true
+	}
 	boxed := current.value.Load()
 	if boxed == nil {
 		return nil, false
@@ -1293,6 +1485,7 @@ func (s *shard) loadOrStoreDeferred(hash uint64, key Key, value any, options Ent
 			bundle.box.expiresAt = time.Now().Add(options.TTL).UnixNano()
 		}
 		bundle.ent.value.Store(&bundle.box)
+		bundle.ent.primeCell(&bundle.box)
 
 		if currentTable.slots[emptyIdx].entry.CompareAndSwap(nil, &bundle.ent) {
 			currentTable.ctrl[emptyIdx] = fp
@@ -1350,6 +1543,7 @@ outer:
 					bundle.box.expiresAt = time.Now().Add(options.TTL).UnixNano()
 				}
 				bundle.ent.value.Store(&bundle.box)
+		bundle.ent.primeCell(&bundle.box)
 
 				if currentTable.slots[index].entry.CompareAndSwap(nil, &bundle.ent) {
 					currentTable.ctrl[index] = fp
@@ -1517,6 +1711,7 @@ func (s *shard) delete(hash uint64, key Key) (any, bool) {
 				continue
 			}
 
+			current.invalidateCell()
 			if current.value.CompareAndSwap(boxed, nil) {
 				s.live.Add(-1)
 				s.tombstones.Add(1)
@@ -1580,11 +1775,13 @@ func (s *shard) compareAndSwap(hash uint64, key Key, oldValue any, boxed *valueB
 				return false
 			}
 
+			current.invalidateCell()
 			if current.value.CompareAndSwap(existing, boxed) {
 				s.valueBytes.Add(boxed.clonedBytes - existing.clonedBytes)
 				if boxed.requiresCleanup() {
 					s.needsCleanup.Store(true)
 				}
+				current.primeCell(boxed)
 				resizeNeeded := s.shouldResizeWithTable(currentTable)
 				s.endWrite()
 				if resizeNeeded {
@@ -1642,6 +1839,7 @@ func (s *shard) compareAndDelete(hash uint64, key Key, oldValue any) bool {
 				return false
 			}
 
+			current.invalidateCell()
 			if current.value.CompareAndSwap(existing, nil) {
 				s.live.Add(-1)
 				s.tombstones.Add(1)
@@ -1749,6 +1947,7 @@ func (s *shard) insertFresh(currentTable *table, index int, hash uint64, key Key
 		key:  cloneKey(key),
 	}
 	fresh.value.Store(boxed)
+	fresh.primeCell(boxed)
 	if currentTable.slots[index].entry.CompareAndSwap(nil, fresh) {
 		currentTable.ctrl[index] = fingerprint(hash)
 		s.live.Add(1)
@@ -1796,11 +1995,13 @@ func (s *shard) replaceOrRevive(current *entry, boxed *valueBox) (any, bool) {
 			continue
 		}
 
+		current.invalidateCell()
 		if current.value.CompareAndSwap(existing, boxed) {
 			s.valueBytes.Add(boxed.clonedBytes - existing.clonedBytes)
 			if boxed.requiresCleanup() {
 				s.needsCleanup.Store(true)
 			}
+			current.primeCell(boxed)
 			return existing.value, true
 		}
 	}
@@ -1842,6 +2043,7 @@ func (s *shard) loadOrStoreCurrent(current *entry, boxed *valueBox) (any, bool) 
 }
 
 func (s *shard) clearIfMatch(current *entry, boxed *valueBox, expired bool, depleted bool) bool {
+	current.invalidateCell()
 	if current.value.CompareAndSwap(boxed, nil) {
 		s.live.Add(-1)
 		s.tombstones.Add(1)
