@@ -6,6 +6,17 @@ import (
 	"unsafe"
 )
 
+func ctrlAllZero8(ctrl []uint32, i int) bool {
+	return atomic.LoadUint32(&ctrl[i]) == 0 &&
+		atomic.LoadUint32(&ctrl[i+1]) == 0 &&
+		atomic.LoadUint32(&ctrl[i+2]) == 0 &&
+		atomic.LoadUint32(&ctrl[i+3]) == 0 &&
+		atomic.LoadUint32(&ctrl[i+4]) == 0 &&
+		atomic.LoadUint32(&ctrl[i+5]) == 0 &&
+		atomic.LoadUint32(&ctrl[i+6]) == 0 &&
+		atomic.LoadUint32(&ctrl[i+7]) == 0
+}
+
 // parallelRangeThreshold is the minimum total live entry count at which
 // Range fans out per-shard workers. Below this the goroutine spawn cost
 // outweighs the parallelism win.
@@ -107,15 +118,14 @@ func rangeWorkerDirect(shards []shard, visitor func(key Key, value any) bool, st
 		nSlots := len(slots)
 		i := 0
 		for ; i+8 <= nSlots; i += 8 {
-			chunk := *(*uint64)(unsafe.Pointer(&ctrl[i]))
-			if chunk == 0 {
+			if ctrlAllZero8(ctrl, i) {
 				continue
 			}
 			if i+16 <= nSlots {
 				prefetchT0(unsafe.Pointer(&slots[i+8]))
 			}
 			for j := 0; j < 8; j++ {
-				if byte(chunk>>(uint(j)*8)) == 0 {
+				if atomic.LoadUint32(&ctrl[i+j]) == 0 {
 					continue
 				}
 				current := slots[i+j].entry.Load()
@@ -141,7 +151,7 @@ func rangeWorkerDirect(shards []shard, visitor func(key Key, value any) bool, st
 			}
 		}
 		for ; i < nSlots; i++ {
-			if ctrl[i] == 0 {
+			if atomic.LoadUint32(&ctrl[i]) == 0 {
 				continue
 			}
 			current := slots[i].entry.Load()
@@ -178,12 +188,14 @@ func rangeShardSequential(s *shard, visitor func(key Key, value any) bool) bool 
 	nSlots := len(slots)
 	i := 0
 	for ; i+8 <= nSlots; i += 8 {
-		chunk := *(*uint64)(unsafe.Pointer(&ctrl[i]))
-		if chunk == 0 {
+		if ctrlAllZero8(ctrl, i) {
 			continue
 		}
+		if i+16 <= nSlots {
+			prefetchT0(unsafe.Pointer(&slots[i+8]))
+		}
 		for j := 0; j < 8; j++ {
-			if ctrl[i+j] == 0 {
+			if atomic.LoadUint32(&ctrl[i+j]) == 0 {
 				continue
 			}
 			current := slots[i+j].entry.Load()
@@ -207,7 +219,7 @@ func rangeShardSequential(s *shard, visitor func(key Key, value any) bool) bool 
 		}
 	}
 	for ; i < nSlots; i++ {
-		if ctrl[i] == 0 {
+		if atomic.LoadUint32(&ctrl[i]) == 0 {
 			continue
 		}
 		current := slots[i].entry.Load()
@@ -265,24 +277,18 @@ func rangeShardsCollect(shards []shard, out *[]rangePair) {
 		// Scan ctrl in 8-byte chunks; skip whole chunks when all slots empty.
 		i := 0
 		for ; i+8 <= nSlots; i += 8 {
-			chunk := *(*uint64)(unsafe.Pointer(&ctrl[i]))
-			if chunk == 0 {
+			if ctrlAllZero8(ctrl, i) {
 				continue
 			}
-			// Prefetch the NEXT chunk's worth of slot data so the cache lines
-			// that hold the entry pointers are warm by the time we get there.
 			if i+16 <= nSlots {
 				prefetchT0(unsafe.Pointer(&slots[i+8]))
 			}
-			// Walk the 8 slots, prefetching each non-empty entry struct one
-			// step ahead of when we actually dereference it.
 			for j := 0; j < 8; j++ {
-				if byte(chunk>>(uint(j)*8)) == 0 {
+				if atomic.LoadUint32(&ctrl[i+j]) == 0 {
 					continue
 				}
-				// One-step lookahead prefetch on the next live entry struct.
 				for k := j + 1; k < 8; k++ {
-					if byte(chunk>>(uint(k)*8)) == 0 {
+					if atomic.LoadUint32(&ctrl[i+k]) == 0 {
 						continue
 					}
 					if nxt := slots[i+k].entry.Load(); nxt != nil {
@@ -308,7 +314,7 @@ func rangeShardsCollect(shards []shard, out *[]rangePair) {
 		}
 		// Tail (final < 8 slots)
 		for ; i < nSlots; i++ {
-			if ctrl[i] == 0 {
+			if atomic.LoadUint32(&ctrl[i]) == 0 {
 				continue
 			}
 			current := slots[i].entry.Load()

@@ -330,7 +330,7 @@ type shard struct {
 
 type table struct {
 	slots  []slot
-	ctrl   []byte
+	ctrl   []uint32
 	mask   uint64
 	growAt int
 }
@@ -683,11 +683,11 @@ func (m *Map) Store(key Key, value any) {
 		newTyp, newData := ifaceWords(value)
 		currentTable := s.table.Load()
 		idx := int(hash & currentTable.mask)
-		fp := byte(hash>>56) | 1
+		fp := uint32(hash>>56) | 1
 		ctrl := currentTable.ctrl
 		mask := int(currentTable.mask)
 		for probes := 0; probes <= mask; probes++ {
-			c := ctrl[idx]
+			c := ctrlLoad(ctrl, idx)
 			if c == 0 {
 				break
 			}
@@ -708,34 +708,32 @@ func (m *Map) Store(key Key, value any) {
 		}
 	}
 
-	// Slow path: allocate a valueBox, CAS-replace any existing one (or insert
-	// fresh), and re-prime the cell with the new (typ, data) at the end so
-	// subsequent same-type Stores hit the fast path again.
-	var boxed *valueBox
-	if m.noClone {
-		boxed = &valueBox{value: value}
-	} else {
-		cloned, tracked := m.cloneValue(value)
-		boxed = &valueBox{value: cloned, clonedBytes: tracked}
-	}
-
+	// Slow path: try CAS-replace inline first (avoids allocation for inserts
+	// until we confirm the key is truly absent).
 	currentTable := s.table.Load()
 	idx := int(hash & currentTable.mask)
-	fp := byte(hash>>56) | 1
+	fp := uint32(hash>>56) | 1
 	ctrl := currentTable.ctrl
 	mask := int(currentTable.mask)
+	foundExisting := false
 	for probes := 0; probes <= mask; probes++ {
-		c := ctrl[idx]
+		c := ctrlLoad(ctrl, idx)
 		if c == 0 {
 			break
 		}
 		if c == fp {
 			current := currentTable.slots[idx].entry.Load()
 			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				foundExisting = true
 				existing := current.value.Load()
 				if existing != nil && existing.expiresAt == 0 && existing.hits.Load() >= 0 {
-					// Invalidate cell before swapping valueBox so concurrent
-					// readers bail to the valueBox path during the change.
+					var boxed *valueBox
+					if m.noClone {
+						boxed = &valueBox{value: value}
+					} else {
+						cloned, tracked := m.cloneValue(value)
+						boxed = &valueBox{value: cloned, clonedBytes: tracked}
+					}
 					current.cellTyp.Store(0)
 					if current.value.CompareAndSwap(existing, boxed) {
 						s.valueBytes.Add(boxed.clonedBytes - existing.clonedBytes)
@@ -749,6 +747,18 @@ func (m *Map) Store(key Key, value any) {
 		idx = (idx + 1) & mask
 	}
 
+	if !foundExisting && m.noClone {
+		s.storeNewBundle(hash, key, value)
+		return
+	}
+
+	var boxed *valueBox
+	if m.noClone {
+		boxed = &valueBox{value: value}
+	} else {
+		cloned, tracked := m.cloneValue(value)
+		boxed = &valueBox{value: cloned, clonedBytes: tracked}
+	}
 	s.store(hash, key, boxed)
 }
 
@@ -812,12 +822,12 @@ func (m *Map) Load(key Key) (any, bool) {
 
 	currentTable := s.table.Load()
 	index := int(hash & currentTable.mask)
-	fp := byte(hash>>56) | 1
+	fp := uint32(hash>>56) | 1
 	ctrl := currentTable.ctrl
 	slots := currentTable.slots
 	mask := int(currentTable.mask)
 	for probes := 0; probes <= mask; probes++ {
-		c := ctrl[index]
+		c := ctrlLoad(ctrl, index)
 		if c == 0 {
 			return nil, false
 		}
@@ -873,8 +883,52 @@ func (m *Map) Get(key Key) (any, bool) {
 // Peek is useful for inspection code that should not advance hit-limited entries.
 // Expired and exhausted entries are treated as absent, just as they are for Load.
 func (m *Map) Peek(key Key) (any, bool) {
-	hash := hashKey(m.seed, key)
-	return m.pickShard(hash).peek(hash, key)
+	var hash uint64
+	if key.isInt {
+		hash = mix(m.seed^uint64(key.i)^hashSeed0, uint64(key.i)^hashSeed1)
+	} else {
+		hash = hashString(m.seed, key.s)
+	}
+
+	s := &m.shards[int((hash>>32)&m.shardMask)]
+	currentTable := s.table.Load()
+	index := int(hash & currentTable.mask)
+	fp := uint32(hash>>56) | 1
+	ctrl := currentTable.ctrl
+	slots := currentTable.slots
+	mask := int(currentTable.mask)
+	for probes := 0; probes <= mask; probes++ {
+		c := ctrlLoad(ctrl, index)
+		if c == 0 {
+			return nil, false
+		}
+		if c == fp {
+			current := slots[index].entry.Load()
+			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				if t := current.cellTyp.Load(); t != 0 {
+					d := current.cellData.Load()
+					return ifaceFromWords(t, unsafe.Pointer(d)), true
+				}
+				boxed := current.value.Load()
+				if boxed == nil {
+					return nil, false
+				}
+				if boxed.expiresAt == 0 {
+					hits := boxed.hits.Load()
+					if hits == 0 {
+						return boxed.value, true
+					}
+					if hits < 0 {
+						return nil, false
+					}
+					return boxed.value, true
+				}
+				return s.readEntrySlow(current, false)
+			}
+		}
+		index = (index + 1) & mask
+	}
+	return nil, false
 }
 
 // Has reports whether key currently resolves to a live entry.
@@ -882,15 +936,59 @@ func (m *Map) Peek(key Key) (any, bool) {
 // Has does not consume hits and is equivalent to discarding the value returned by
 // Peek.
 func (m *Map) Has(key Key) bool {
-	_, ok := m.Peek(key)
-	return ok
+	var hash uint64
+	if key.isInt {
+		hash = mix(m.seed^uint64(key.i)^hashSeed0, uint64(key.i)^hashSeed1)
+	} else {
+		hash = hashString(m.seed, key.s)
+	}
+
+	s := &m.shards[int((hash>>32)&m.shardMask)]
+	currentTable := s.table.Load()
+	index := int(hash & currentTable.mask)
+	fp := uint32(hash>>56) | 1
+	ctrl := currentTable.ctrl
+	slots := currentTable.slots
+	mask := int(currentTable.mask)
+	for probes := 0; probes <= mask; probes++ {
+		c := ctrlLoad(ctrl, index)
+		if c == 0 {
+			return false
+		}
+		if c == fp {
+			current := slots[index].entry.Load()
+			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				if current.cellTyp.Load() != 0 {
+					return true
+				}
+				boxed := current.value.Load()
+				if boxed == nil {
+					return false
+				}
+				if boxed.expiresAt == 0 {
+					return boxed.hits.Load() >= 0
+				}
+				if boxed.expiresAt > 0 && time.Now().UnixNano() >= boxed.expiresAt {
+					return false
+				}
+				return boxed.hits.Load() >= 0
+			}
+		}
+		index = (index + 1) & mask
+	}
+	return false
 }
 
 // Delete removes key and returns the previous live value when present.
 //
 // If the key is absent, expired, or already exhausted, Delete returns nil and false.
 func (m *Map) Delete(key Key) (any, bool) {
-	hash := hashKey(m.seed, key)
+	var hash uint64
+	if key.isInt {
+		hash = mix(m.seed^uint64(key.i)^hashSeed0, uint64(key.i)^hashSeed1)
+	} else {
+		hash = hashString(m.seed, key.s)
+	}
 	return m.pickShard(hash).delete(hash, key)
 }
 
@@ -900,22 +998,31 @@ func (m *Map) Delete(key Key) (any, bool) {
 // loaded true. Otherwise it stores the supplied value with default behavior and
 // returns the stored value with loaded false.
 func (m *Map) LoadOrStore(key Key, value any) (any, bool) {
-	hash := hashKey(m.seed, key)
+	var hash uint64
+	if key.isInt {
+		hash = mix(m.seed^uint64(key.i)^hashSeed0, uint64(key.i)^hashSeed1)
+	} else {
+		hash = hashString(m.seed, key.s)
+	}
 	s := m.pickShard(hash)
 
 	currentTable := s.table.Load()
 	idx := int(hash & currentTable.mask)
-	fp := byte(hash>>56) | 1
+	fp := uint32(hash>>56) | 1
 	ctrl := currentTable.ctrl
 	mask := int(currentTable.mask)
 	for probes := 0; probes <= mask; probes++ {
-		c := ctrl[idx]
+		c := ctrlLoad(ctrl, idx)
 		if c == 0 {
 			break
 		}
 		if c == fp {
 			current := currentTable.slots[idx].entry.Load()
 			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				if t := current.cellTyp.Load(); t != 0 {
+					d := current.cellData.Load()
+					return ifaceFromWords(t, unsafe.Pointer(d)), true
+				}
 				existing := current.value.Load()
 				if existing != nil && existing.expiresAt == 0 && existing.hits.Load() == 0 {
 					return existing.value, true
@@ -952,7 +1059,46 @@ func (m *Map) LoadOrStoreWithOptions(key Key, value any, options EntryOptions) (
 // The replacement entry uses the default behavior of no TTL and no hit limit. If the
 // key was absent, Swap stores the new value and returns nil, false.
 func (m *Map) Swap(key Key, value any) (any, bool) {
-	return m.SwapWithOptions(key, value, EntryOptions{})
+	var hash uint64
+	if key.isInt {
+		hash = mix(m.seed^uint64(key.i)^hashSeed0, uint64(key.i)^hashSeed1)
+	} else {
+		hash = hashString(m.seed, key.s)
+	}
+	s := m.pickShard(hash)
+
+	if m.noClone {
+		newTyp, newData := ifaceWords(value)
+		currentTable := s.table.Load()
+		idx := int(hash & currentTable.mask)
+		fp := uint32(hash>>56) | 1
+		ctrl := currentTable.ctrl
+		mask := int(currentTable.mask)
+		for probes := 0; probes <= mask; probes++ {
+			c := ctrlLoad(ctrl, idx)
+			if c == 0 {
+				break
+			}
+			if c == fp {
+				current := currentTable.slots[idx].entry.Load()
+				if current != nil && current.hash == hash && keysEqual(current.key, key) {
+					if current.cellTyp.Load() == newTyp && newTyp != 0 {
+						existing := current.value.Load()
+						if existing != nil && existing.expiresAt == 0 && existing.clonedBytes == 0 && existing.hits.Load() == 0 {
+							oldData := current.cellData.Load()
+							current.cellData.Store((*byte)(newData))
+							return ifaceFromWords(newTyp, unsafe.Pointer(oldData)), true
+						}
+					}
+					break
+				}
+			}
+			idx = (idx + 1) & mask
+		}
+	}
+
+	boxed := m.newValueBox(value, EntryOptions{})
+	return s.swap(hash, key, boxed)
 }
 
 // SwapWithOptions atomically replaces the value for key and applies EntryOptions to the replacement.
@@ -971,7 +1117,46 @@ func (m *Map) SwapWithOptions(key Key, value any, options EntryOptions) (any, bo
 // and built-in handling for several slice and map forms. The replacement uses the
 // default entry behavior with no TTL and no hit limit.
 func (m *Map) CompareAndSwap(key Key, oldValue any, newValue any) bool {
-	return m.CompareAndSwapWithOptions(key, oldValue, newValue, EntryOptions{})
+	var hash uint64
+	if key.isInt {
+		hash = mix(m.seed^uint64(key.i)^hashSeed0, uint64(key.i)^hashSeed1)
+	} else {
+		hash = hashString(m.seed, key.s)
+	}
+	s := m.pickShard(hash)
+
+	currentTable := s.table.Load()
+	idx := int(hash & currentTable.mask)
+	fp := uint32(hash>>56) | 1
+	ctrl := currentTable.ctrl
+	mask := int(currentTable.mask)
+	for probes := 0; probes <= mask; probes++ {
+		c := ctrlLoad(ctrl, idx)
+		if c == 0 {
+			return false
+		}
+		if c == fp {
+			current := currentTable.slots[idx].entry.Load()
+			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				existing := current.value.Load()
+				if existing == nil {
+					return false
+				}
+				if existing.expiresAt != 0 || existing.hits.Load() < 0 {
+					break
+				}
+				if !valuesEqual(existing.value, oldValue) {
+					return false
+				}
+				boxed := m.newValueBox(newValue, EntryOptions{})
+				return s.compareAndSwap(hash, key, oldValue, boxed)
+			}
+		}
+		idx = (idx + 1) & mask
+	}
+
+	boxed := m.newValueBox(newValue, EntryOptions{})
+	return s.compareAndSwap(hash, key, oldValue, boxed)
 }
 
 // CompareAndSwapWithOptions replaces the current value only when it matches oldValue and applies EntryOptions to the replacement.
@@ -1242,24 +1427,6 @@ func (m *Map) pickShard(hash uint64) *shard {
 	return &m.shards[index]
 }
 
-func (s *shard) load(hash uint64, key Key) (any, bool) {
-	currentTable := s.table.Load()
-	current := findEntry(currentTable, hash, key)
-	if current == nil {
-		return nil, false
-	}
-	return s.readEntry(current, true)
-}
-
-func (s *shard) peek(hash uint64, key Key) (any, bool) {
-	currentTable := s.table.Load()
-	current := findEntry(currentTable, hash, key)
-	if current == nil {
-		return nil, false
-	}
-	return s.readEntry(current, false)
-}
-
 func (s *shard) readEntry(current *entry, consumeHits bool) (any, bool) {
 	if t := current.cellTyp.Load(); t != 0 {
 		d := current.cellData.Load()
@@ -1399,47 +1566,6 @@ outer:
 	}
 }
 
-func (s *shard) loadOrStore(hash uint64, key Key, boxed *valueBox) (any, bool) {
-outer:
-	for {
-		s.beginWrite()
-		currentTable := s.table.Load()
-		index := int(hash & currentTable.mask)
-
-		for probes := 0; probes < len(currentTable.slots); probes++ {
-			current := currentTable.slots[index].entry.Load()
-			if current == nil {
-				inserted, retry, resizeNeeded := s.insertFresh(currentTable, index, hash, key, boxed)
-				s.endWrite()
-				if retry {
-					continue outer
-				}
-				if resizeNeeded {
-					s.resize(int(s.live.Load()) + 1)
-				}
-				if inserted {
-					return boxed.value, false
-				}
-				continue outer
-			}
-
-			if current.hash == hash && keysEqual(current.key, key) {
-				actual, loaded := s.loadOrStoreCurrent(current, boxed)
-				resizeNeeded := !loaded && s.shouldResizeWithTable(currentTable)
-				s.endWrite()
-				if resizeNeeded {
-					s.resize(int(s.live.Load()))
-				}
-				return actual, loaded
-			}
-
-			index = (index + 1) & int(currentTable.mask)
-		}
-
-		s.endWrite()
-		s.resize(int(s.live.Load()) + 1)
-	}
-}
 func (s *shard) loadOrStoreDeferred(hash uint64, key Key, value any, options EntryOptions, cloneFunc ValueCloneFunc) (any, bool) {
 	currentTable := s.table.Load()
 	idx := int(hash & currentTable.mask)
@@ -1447,7 +1573,7 @@ func (s *shard) loadOrStoreDeferred(hash uint64, key Key, value any, options Ent
 	emptyIdx := -1
 	mask := int(currentTable.mask)
 	for probes := 0; probes <= mask; probes++ {
-		c := currentTable.ctrl[idx]
+		c := ctrlLoad(currentTable.ctrl, idx)
 		if c == 0 {
 			emptyIdx = idx
 			break
@@ -1488,7 +1614,7 @@ func (s *shard) loadOrStoreDeferred(hash uint64, key Key, value any, options Ent
 		bundle.ent.primeCell(&bundle.box)
 
 		if currentTable.slots[emptyIdx].entry.CompareAndSwap(nil, &bundle.ent) {
-			currentTable.ctrl[emptyIdx] = fp
+			ctrlStore(currentTable.ctrl, emptyIdx, fp)
 			if s.table.Load() == currentTable {
 				s.live.Add(1)
 				used := s.used.Add(1)
@@ -1546,7 +1672,7 @@ outer:
 		bundle.ent.primeCell(&bundle.box)
 
 				if currentTable.slots[index].entry.CompareAndSwap(nil, &bundle.ent) {
-					currentTable.ctrl[index] = fp
+					ctrlStore(currentTable.ctrl, index, fp)
 					s.live.Add(1)
 					used := s.used.Add(1)
 					s.keyBytes.Add(keySize(key))
@@ -1711,6 +1837,13 @@ func (s *shard) delete(hash uint64, key Key) (any, bool) {
 				continue
 			}
 
+			var deletedValue any
+			if t := current.cellTyp.Load(); t != 0 {
+				d := current.cellData.Load()
+				deletedValue = ifaceFromWords(t, unsafe.Pointer(d))
+			} else {
+				deletedValue = boxed.value
+			}
 			current.invalidateCell()
 			if current.value.CompareAndSwap(boxed, nil) {
 				s.live.Add(-1)
@@ -1723,7 +1856,7 @@ func (s *shard) delete(hash uint64, key Key) (any, bool) {
 				if resizeNeeded {
 					s.resize(int(s.live.Load()))
 				}
-				return boxed.value, true
+				return deletedValue, true
 			}
 		}
 	}
@@ -1949,7 +2082,7 @@ func (s *shard) insertFresh(currentTable *table, index int, hash uint64, key Key
 	fresh.value.Store(boxed)
 	fresh.primeCell(boxed)
 	if currentTable.slots[index].entry.CompareAndSwap(nil, fresh) {
-		currentTable.ctrl[index] = fingerprint(hash)
+		ctrlStore(currentTable.ctrl, index, fingerprint(hash))
 		s.live.Add(1)
 		used := s.used.Add(1)
 		s.keyBytes.Add(keySize(key))
@@ -1962,6 +2095,56 @@ func (s *shard) insertFresh(currentTable *table, index int, hash uint64, key Key
 		return true, false, used >= int64(currentTable.growAt)
 	}
 	return false, true, false
+}
+
+func (s *shard) storeNewBundle(hash uint64, key Key, value any) {
+outer:
+	for {
+		s.beginWrite()
+		currentTable := s.table.Load()
+		index := int(hash & currentTable.mask)
+
+		for probes := 0; probes < len(currentTable.slots); probes++ {
+			current := currentTable.slots[index].entry.Load()
+			if current == nil {
+				bundle := &entryBundle{}
+				bundle.ent.hash = hash
+				bundle.ent.key = cloneKey(key)
+				bundle.box.value = value
+				bundle.ent.value.Store(&bundle.box)
+				bundle.ent.primeCell(&bundle.box)
+				if currentTable.slots[index].entry.CompareAndSwap(nil, &bundle.ent) {
+					ctrlStore(currentTable.ctrl, index, fingerprint(hash))
+					s.live.Add(1)
+					used := s.used.Add(1)
+					s.keyBytes.Add(keySize(key))
+					s.endWrite()
+					if used >= int64(currentTable.growAt) {
+						s.resize(int(s.live.Load()) + 1)
+					}
+					return
+				}
+				s.endWrite()
+				continue outer
+			}
+
+			if current.hash == hash && keysEqual(current.key, key) {
+				boxed := &valueBox{value: value}
+				s.replaceOrRevive(current, boxed)
+				resizeNeeded := s.shouldResizeWithTable(currentTable)
+				s.endWrite()
+				if resizeNeeded {
+					s.resize(int(s.live.Load()))
+				}
+				return
+			}
+
+			index = (index + 1) & int(currentTable.mask)
+		}
+
+		s.endWrite()
+		s.resize(int(s.live.Load()) + 1)
+	}
 }
 
 func (s *shard) replaceOrRevive(current *entry, boxed *valueBox) (any, bool) {
@@ -2229,7 +2412,7 @@ func (t *table) insertClone(current *entry) {
 	for {
 		if t.slots[index].entry.Load() == nil {
 			t.slots[index].entry.Store(current)
-			t.ctrl[index] = fingerprint(current.hash)
+			ctrlStore(t.ctrl, index, fingerprint(current.hash))
 			return
 		}
 		index = (index + 1) & int(t.mask)
@@ -2243,7 +2426,7 @@ func findEntry(currentTable *table, hash uint64, key Key) *entry {
 	slots := currentTable.slots
 	mask := int(currentTable.mask)
 	for probes := 0; probes <= mask; probes++ {
-		c := ctrl[index]
+		c := ctrlLoad(ctrl, index)
 		if c == 0 {
 			return nil
 		}
@@ -2258,9 +2441,16 @@ func findEntry(currentTable *table, hash uint64, key Key) *entry {
 	return nil
 }
 
-func fingerprint(hash uint64) byte {
-	fp := byte(hash>>56) | 1
-	return fp
+func fingerprint(hash uint64) uint32 {
+	return uint32(hash>>56) | 1
+}
+
+func ctrlLoad(ctrl []uint32, i int) uint32 {
+	return atomic.LoadUint32(&ctrl[i])
+}
+
+func ctrlStore(ctrl []uint32, i int, v uint32) {
+	atomic.StoreUint32(&ctrl[i], v)
 }
 
 func keysEqual(a, b Key) bool {
@@ -2302,7 +2492,7 @@ func newTableWithSlots(slotCount int, loadFactor float64) *table {
 	}
 	return &table{
 		slots:  make([]slot, slotCount),
-		ctrl:   make([]byte, slotCount),
+		ctrl:   make([]uint32, slotCount),
 		mask:   uint64(slotCount - 1),
 		growAt: growAt,
 	}
@@ -2317,13 +2507,6 @@ func slotsForEntries(entries int, loadFactor float64) int {
 		slots = minTableSlots
 	}
 	return nextPowerOfTwo(slots)
-}
-
-func normalizeHits(hits int64) int64 {
-	if hits <= 0 {
-		return 0
-	}
-	return hits
 }
 
 func (b *valueBox) requiresCleanup() bool {
