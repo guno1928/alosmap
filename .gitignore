@@ -1,0 +1,24 @@
+# Allowlist: this repository contains only the production library source.
+# Everything is ignored by default; production files are re-included below.
+# Build artifacts, profiles, benchmark output, scratch docs, and tests stay local.
+
+/*
+
+!/.gitignore
+!/go.mod
+!/go.sum
+!/README.md
+!/doc.go
+!/map.go
+!/hash.go
+!/fastcell.go
+!/modifiers.go
+!/rangefast.go
+!/typedmap.go
+!/testall.go
+!/testall_test.go
+!/iface_amd64.go
+!/iface_amd64.s
+!/prefetch_amd64.go
+!/prefetch_amd64.s
+!/prefetch_generic.go
