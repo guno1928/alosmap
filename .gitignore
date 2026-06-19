@@ -15,6 +15,7 @@
 !/modifiers.go
 !/rangefast.go
 !/typedmap.go
+!/typedmap_testall.go
 !/testall.go
 !/testall_test.go
 !/iface_amd64.go

@@ -10,8 +10,10 @@ go get github.com/guno1928/alosmap
 
 ## Test Suite
 
-`testall.go` holds the large registered case list for the package. Run that registry through the
-`TestAllCases` harness with:
+`testall.go` holds the large registered case list for the package, and `typedmap_testall.go` adds
+300 dedicated `TypedMap[K, V]` cases (IDs 301–600) covering round-trips across key/value types,
+delete/probe-chain integrity, `Range`/`Len`, pointer identity, `Prealloc`, table growth, tombstone
+reuse, and concurrent torn-read stress. Run the full registry through the `TestAllCases` harness with:
 
 ```bash
 go test -run TestAllCases -count=1 -v
@@ -25,7 +27,7 @@ go test -count=1 ./...
 
 Latest local run in this repo:
 
-- `TestAllCases`: `275/275` `testall.go` cases passed
+- `TestAllCases`: `575/575` cases passed (275 core + 300 `TypedMap` cases)
 - Typed map, prealloc, and concurrency/race suites pass (`-race` clean)
 - Full package suite: `ok github.com/guno1928/alosmap`
 

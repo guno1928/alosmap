@@ -1166,8 +1166,7 @@ func (m *Map) Swap(key Key, value any) (any, bool) {
 				current := currentTable.slots[idx].entry.Load()
 				if current != nil && current.hash == hash && keysEqual(current.key, key) {
 					if b := current.value.Load(); b != nil && b.isSimple() && b.typ == newTyp && newTyp != 0 {
-						oldData := b.data.Load()
-						b.data.Store((*byte)(newData))
+						oldData := b.data.Swap((*byte)(newData))
 						return ifaceFromWords(newTyp, unsafe.Pointer(oldData)), true
 					}
 					break
