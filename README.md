@@ -157,11 +157,13 @@ Head-to-head against the four maps Go developers actually reach for:
 Machine: AMD Ryzen 7 5700X, 16 threads, Windows, Go 1.26. Parallel benches
 unless noted. Lower is better. **Bold = fastest in the row.**
 
-All six maps are benchmarked **in this repo**, head-to-head, from
-`bench_compare_all_test.go` — reproduce with:
+All six maps are benchmarked **in this repo**, head-to-head, in the
+[`benchmarks/`](benchmarks/) folder (a separate module so the competitor deps
+never touch the library). Reproduce on your own hardware with:
 
 ```bash
-go test -run='^$' -bench='BenchmarkX_' -benchtime=100ms -count=2
+cd benchmarks
+go test -run='^$' -bench='BenchmarkX_' -benchmem -benchtime=150ms -count=3
 ```
 
 ### Headline scorecard

@@ -23,3 +23,7 @@
 !/prefetch_amd64.go
 !/prefetch_amd64.s
 !/prefetch_generic.go
+
+# Benchmark suite (separate module). Its own .gitignore drops results/.
+!/benchmarks/
+!/benchmarks/**
