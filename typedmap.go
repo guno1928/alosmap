@@ -4,6 +4,7 @@ import (
 	"hash/maphash"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -41,6 +42,7 @@ type typedEntry[K comparable] struct {
 	hash uint64
 	key  K
 	bits atomic.Uint64
+	meta atomic.Pointer[typedMeta]
 }
 
 func toBits[V any](v V) uint64 {
@@ -177,11 +179,22 @@ func (m *TypedMap[K, V]) find(t *typedTable[K], h uint64, key K) *typedEntry[K] 
 func (m *TypedMap[K, V]) Load(key K) (V, bool) {
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
-	if e := m.find(s.table.Load(), h, key); e != nil {
-		return fromBits[V](e.bits.Load()), true
+	e := m.find(s.table.Load(), h, key)
+	if e == nil {
+		var zero V
+		return zero, false
 	}
-	var zero V
-	return zero, false
+	if md := e.meta.Load(); md != nil {
+		if md.expireAt != 0 && time.Now().UnixNano() >= md.expireAt {
+			var zero V
+			return zero, false
+		}
+		if md.hitLimited && md.hits.Add(-1) < 0 {
+			var zero V
+			return zero, false
+		}
+	}
+	return fromBits[V](e.bits.Load()), true
 }
 
 // Store sets key to val, inserting a new entry or replacing an existing one.
@@ -202,6 +215,9 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 
 	if e := m.find(s.table.Load(), h, key); e != nil {
 		e.bits.Store(bits)
+		if e.meta.Load() != nil {
+			e.meta.Store(nil)
+		}
 		return
 	}
 
@@ -234,6 +250,9 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 			}
 		} else if e.hash == h && e.key == key {
 			e.bits.Store(bits)
+			if e.meta.Load() != nil {
+				e.meta.Store(nil)
+			}
 			s.mu.Unlock()
 			return
 		}
@@ -266,8 +285,16 @@ func (m *TypedMap[K, V]) Delete(key K) (V, bool) {
 		}
 		if e != m.tomb && e.hash == h && e.key == key {
 			v := fromBits[V](e.bits.Load())
+			dead := false
+			if md := e.meta.Load(); md != nil && md.deadForView(time.Now().UnixNano()) {
+				dead = true
+			}
 			t.slots[idx].Store(m.tomb)
 			s.mu.Unlock()
+			if dead {
+				var zero V
+				return zero, false
+			}
 			return v, true
 		}
 		idx = (idx + 1) & t.mask
@@ -291,12 +318,16 @@ func (m *TypedMap[K, V]) Delete(key K) (V, bool) {
 //		return v != target // returning false stops iteration
 //	})
 func (m *TypedMap[K, V]) Range(visitor func(key K, value V) bool) {
+	now := time.Now().UnixNano()
 	for si := range m.shards {
 		t := m.shards[si].table.Load()
 		slots := t.slots
 		for j := range slots {
 			e := slots[j].Load()
 			if e == nil || e == m.tomb {
+				continue
+			}
+			if md := e.meta.Load(); md != nil && md.deadForView(now) {
 				continue
 			}
 			if !visitor(e.key, fromBits[V](e.bits.Load())) {
@@ -308,13 +339,19 @@ func (m *TypedMap[K, V]) Range(visitor func(key K, value V) bool) {
 
 // Len returns the number of live entries currently in the map.
 func (m *TypedMap[K, V]) Len() int {
+	now := time.Now().UnixNano()
 	n := 0
 	for si := range m.shards {
 		t := m.shards[si].table.Load()
 		for j := range t.slots {
-			if e := t.slots[j].Load(); e != nil && e != m.tomb {
-				n++
+			e := t.slots[j].Load()
+			if e == nil || e == m.tomb {
+				continue
 			}
+			if md := e.meta.Load(); md != nil && md.deadForView(now) {
+				continue
+			}
+			n++
 		}
 	}
 	return n
