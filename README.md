@@ -423,9 +423,10 @@ the struct directly:
 
 | Pattern                                  |       ops/s |  ns/op | allocs |
 |------------------------------------------|------------:|-------:|:-------|
-| `atomic.Int64.Add` via loaded pointer    |   1 573 M/s |  0.635 | 0      |
-| `atomic.Value.Store` via loaded pointer  |     668 M/s |  1.497 | 0      |
-| `StringSet` via loaded pointer           |    91.1 M/s | 10.98  | 2      |
+| `atomic.Int64.Add` via loaded pointer    |     608 M/s |  1.645 | 0      |
+| `atomic.Bool.Store` via loaded pointer   |     584 M/s |  1.711 | 0      |
+| `atomic.Value.Store` via loaded pointer  |     271 M/s |  3.689 | 0      |
+| `StringSet` via loaded pointer           |    33.9 M/s | 29.49  | 2      |
 
 ### Value and key semantics
 
@@ -477,6 +478,7 @@ type Session struct {
 	Bytes  atomic.Int64
 	Name   atomic.Value
 	Status atomic.Value
+	Active atomic.Bool
 }
 
 m := alosmap.New()
@@ -485,6 +487,7 @@ defer m.Close()
 sess := &Session{}
 sess.Name.Store("alice")
 sess.Status.Store("warm")
+sess.Active.Store(true)
 m.Store(alosmap.S("sess:1"), sess)
 
 ptr, _ := m.Load(alosmap.S("sess:1"))
@@ -494,6 +497,7 @@ live.Bytes.Add(512)
 live.Bytes.Add(-128)
 alosmap.StringSet(&live.Name, "alice-prod")
 alosmap.StringSet(&live.Status, "ready")
+live.Active.Store(false)
 
 ptr2, _ := m.Load(alosmap.S("sess:1"))
 same := ptr2.(*Session)
@@ -501,7 +505,7 @@ fmt.Println(live == same) // true
 
 m.Range(func(key alosmap.Key, value any) bool {
 	v := value.(*Session)
-	fmt.Println(key.String(), v.Hits.Load(), v.Bytes.Load(), v.Name.Load(), v.Status.Load())
+	fmt.Println(key.String(), v.Hits.Load(), v.Bytes.Load(), v.Name.Load(), v.Status.Load(), v.Active.Load())
 	return true
 })
 ```
@@ -1343,6 +1347,7 @@ type Stats struct {
 	Count  atomic.Int64
 	Bytes  atomic.Int64
 	Status atomic.Value
+	Live   atomic.Bool
 }
 
 m := alosmap.New()
@@ -1350,6 +1355,7 @@ defer m.Close()
 
 stats := &Stats{}
 stats.Status.Store("initial")
+stats.Live.Store(true)
 m.Store(alosmap.S("stats:api"), stats)
 
 value, _ := m.Load(alosmap.S("stats:api"))
@@ -1358,8 +1364,9 @@ live.Count.Add(1)
 live.Bytes.Add(1024)
 live.Bytes.Add(-256)
 alosmap.StringSet(&live.Status, "updated")
+live.Live.Store(false)
 
-fmt.Println(live.Count.Load(), live.Bytes.Load(), live.Status.Load())
+fmt.Println(live.Count.Load(), live.Bytes.Load(), live.Status.Load(), live.Live.Load())
 ```
 
 That pattern is what the direct-pointer benchmarks measure. It avoids map-level write
