@@ -6,7 +6,7 @@ import (
 
 	"github.com/guno1928/alosmap"
 	cmap "github.com/orcaman/concurrent-map/v2"
-	"github.com/puzpuzpuz/xsync/v3"
+	"github.com/puzpuzpuz/xsync/v4"
 )
 
 const benchN = 8192
@@ -89,8 +89,8 @@ func filledRW(keys []string) *rwMap {
 	return m
 }
 
-func filledXsync(keys []string) *xsync.MapOf[string, int64] {
-	m := xsync.NewMapOf[string, int64](xsync.WithPresize(len(keys)))
+func filledXsync(keys []string) *xsync.Map[string, int64] {
+	m := xsync.NewMap[string, int64](xsync.WithPresize(len(keys)))
 	for i, k := range keys {
 		m.Store(k, int64(i))
 	}

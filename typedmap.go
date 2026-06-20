@@ -2,6 +2,7 @@ package alosmap
 
 import (
 	"hash/maphash"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +19,10 @@ import (
 // such as *MyStruct.
 type TypedMap[K comparable, V any] struct {
 	seed      maphash.Seed
+	seed64    uint64
+	keyKind   uint8
+	valPtr    bool
+	hasMeta   atomic.Bool
 	shardMask uint64
 	tomb      *typedEntry[K]
 	shards    []typedShard[K]
@@ -31,6 +36,7 @@ type TypedMap[K comparable, V any] struct {
 
 type typedShard[K comparable] struct {
 	table atomic.Pointer[typedTable[K]]
+	_     [56]byte
 	mu    sync.Mutex
 	chunk []typedEntry[K]
 	off   int
@@ -48,7 +54,27 @@ type typedEntry[K comparable] struct {
 	hash uint64
 	key  K
 	bits atomic.Uint64
+	ptr  atomic.Pointer[byte]
 	meta atomic.Pointer[typedMeta]
+}
+
+const (
+	keyKindOther uint8 = iota
+	keyKindString
+	keyKindInt64
+)
+
+func detectKeyKind[K comparable]() uint8 {
+	var z K
+	switch any(z).(type) {
+	case string:
+		return keyKindString
+	case int, int64, uint, uint64, uintptr:
+		if unsafe.Sizeof(z) == 8 {
+			return keyKindInt64
+		}
+	}
+	return keyKindOther
 }
 
 func toBits[V any](v V) uint64 {
@@ -59,6 +85,59 @@ func toBits[V any](v V) uint64 {
 
 func fromBits[V any](b uint64) V {
 	return *(*V)(unsafe.Pointer(&b))
+}
+
+// valueHasPointer reports whether V contains a pointer the garbage collector
+// must track. A V that contains a pointer and fits in a machine word is itself a
+// single pointer, so such values are stored in a GC-scanned pointer field rather
+// than the unscanned bits word (otherwise GC would reclaim the pointee).
+func valueHasPointer[V any]() bool {
+	return typeHasPointer(reflect.TypeFor[V]())
+}
+
+func typeHasPointer(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Pointer, reflect.UnsafePointer, reflect.Chan, reflect.Map,
+		reflect.Func, reflect.Slice, reflect.String, reflect.Interface:
+		return true
+	case reflect.Array:
+		return t.Len() > 0 && typeHasPointer(t.Elem())
+	case reflect.Struct:
+		for i := 0; i < t.NumField(); i++ {
+			if typeHasPointer(t.Field(i).Type) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// storeVal publishes val into the entry's GC-correct slot. Pointer-typed values
+// go into the scanned ptr word so the collector keeps the pointee alive; scalar
+// values go into the unscanned bits word.
+func (m *TypedMap[K, V]) storeVal(e *typedEntry[K], val V) {
+	if m.valPtr {
+		e.ptr.Store(*(**byte)(unsafe.Pointer(&val)))
+	} else {
+		e.bits.Store(toBits(val))
+	}
+}
+
+func (m *TypedMap[K, V]) loadVal(e *typedEntry[K]) V {
+	if m.valPtr {
+		p := e.ptr.Load()
+		return *(*V)(unsafe.Pointer(&p))
+	}
+	return fromBits[V](e.bits.Load())
+}
+
+func (m *TypedMap[K, V]) valEqual(e *typedEntry[K], val V) bool {
+	if m.valPtr {
+		return e.ptr.Load() == *(**byte)(unsafe.Pointer(&val))
+	}
+	return e.bits.Load() == toBits(val)
 }
 
 // NewTyped returns an empty TypedMap with a default capacity and an automatically
@@ -114,8 +193,15 @@ func newTypedFromConfig[K comparable, V any](cfg config) *TypedMap[K, V] {
 	cfg.normalize()
 	shardCount := cfg.shardCount
 	perShard := nextPowerOfTwo(maxInt(8, cfg.capacity/shardCount*2))
+	seed64 := avalanche(uint64(time.Now().UnixNano()) ^ (uint64(shardCount) << 32) ^ hashSeed2)
+	if seed64 == 0 {
+		seed64 = hashSeed1
+	}
 	m := &TypedMap[K, V]{
 		seed:            maphash.MakeSeed(),
+		seed64:          seed64,
+		keyKind:         detectKeyKind[K](),
+		valPtr:          valueHasPointer[V](),
 		shardMask:       uint64(shardCount - 1),
 		tomb:            &typedEntry[K]{},
 		shards:          make([]typedShard[K], shardCount),
@@ -196,7 +282,14 @@ func (s *typedShard[K]) newEntry() *typedEntry[K] {
 }
 
 func (m *TypedMap[K, V]) hash(key K) uint64 {
-	return maphash.Comparable(m.seed, key)
+	switch m.keyKind {
+	case keyKindString:
+		return hashString(m.seed64, *(*string)(unsafe.Pointer(&key)))
+	case keyKindInt64:
+		return hashInt64(m.seed64, *(*int64)(unsafe.Pointer(&key)))
+	default:
+		return maphash.Comparable(m.seed, key)
+	}
 }
 
 func (m *TypedMap[K, V]) find(t *typedTable[K], h uint64, key K) *typedEntry[K] {
@@ -231,17 +324,19 @@ func (m *TypedMap[K, V]) Load(key K) (V, bool) {
 		var zero V
 		return zero, false
 	}
-	if md := e.meta.Load(); md != nil {
-		if md.expireAt != 0 && time.Now().UnixNano() >= md.expireAt {
-			var zero V
-			return zero, false
-		}
-		if md.hitLimited && md.hits.Add(-1) < 0 {
-			var zero V
-			return zero, false
+	if m.hasMeta.Load() {
+		if md := e.meta.Load(); md != nil {
+			if md.expireAt != 0 && time.Now().UnixNano() >= md.expireAt {
+				var zero V
+				return zero, false
+			}
+			if md.hitLimited && md.hits.Add(-1) < 0 {
+				var zero V
+				return zero, false
+			}
 		}
 	}
-	return fromBits[V](e.bits.Load()), true
+	return m.loadVal(e), true
 }
 
 // Store sets key to val, inserting a new entry or replacing an existing one.
@@ -258,11 +353,10 @@ func (m *TypedMap[K, V]) Load(key K) (V, bool) {
 func (m *TypedMap[K, V]) Store(key K, val V) {
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
-	bits := toBits(val)
 
 	if e := m.find(s.table.Load(), h, key); e != nil {
-		e.bits.Store(bits)
-		if e.meta.Load() != nil {
+		m.storeVal(e, val)
+		if m.hasMeta.Load() && e.meta.Load() != nil {
 			e.meta.Store(nil)
 		}
 		return
@@ -281,7 +375,7 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 			ne := s.newEntry()
 			ne.hash = h
 			ne.key = key
-			ne.bits.Store(bits)
+			m.storeVal(ne, val)
 			if firstTomb >= 0 {
 				t.slots[firstTomb].Store(ne)
 			} else {
@@ -296,7 +390,7 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 				firstTomb = int(idx)
 			}
 		} else if e.hash == h && e.key == key {
-			e.bits.Store(bits)
+			m.storeVal(e, val)
 			if e.meta.Load() != nil {
 				e.meta.Store(nil)
 			}
@@ -331,7 +425,7 @@ func (m *TypedMap[K, V]) Delete(key K) (V, bool) {
 			return zero, false
 		}
 		if e != m.tomb && e.hash == h && e.key == key {
-			v := fromBits[V](e.bits.Load())
+			v := m.loadVal(e)
 			dead := false
 			if md := e.meta.Load(); md != nil && md.deadForView(time.Now().UnixNano()) {
 				dead = true
@@ -365,7 +459,11 @@ func (m *TypedMap[K, V]) Delete(key K) (V, bool) {
 //		return v != target // returning false stops iteration
 //	})
 func (m *TypedMap[K, V]) Range(visitor func(key K, value V) bool) {
-	now := time.Now().UnixNano()
+	hasMeta := m.hasMeta.Load()
+	var now int64
+	if hasMeta {
+		now = time.Now().UnixNano()
+	}
 	for si := range m.shards {
 		t := m.shards[si].table.Load()
 		slots := t.slots
@@ -374,10 +472,12 @@ func (m *TypedMap[K, V]) Range(visitor func(key K, value V) bool) {
 			if e == nil || e == m.tomb {
 				continue
 			}
-			if md := e.meta.Load(); md != nil && md.deadForView(now) {
-				continue
+			if hasMeta {
+				if md := e.meta.Load(); md != nil && md.deadForView(now) {
+					continue
+				}
 			}
-			if !visitor(e.key, fromBits[V](e.bits.Load())) {
+			if !visitor(e.key, m.loadVal(e)) {
 				return
 			}
 		}
@@ -386,7 +486,11 @@ func (m *TypedMap[K, V]) Range(visitor func(key K, value V) bool) {
 
 // Len returns the number of live entries currently in the map.
 func (m *TypedMap[K, V]) Len() int {
-	now := time.Now().UnixNano()
+	hasMeta := m.hasMeta.Load()
+	var now int64
+	if hasMeta {
+		now = time.Now().UnixNano()
+	}
 	n := 0
 	for si := range m.shards {
 		t := m.shards[si].table.Load()
@@ -395,8 +499,10 @@ func (m *TypedMap[K, V]) Len() int {
 			if e == nil || e == m.tomb {
 				continue
 			}
-			if md := e.meta.Load(); md != nil && md.deadForView(now) {
-				continue
+			if hasMeta {
+				if md := e.meta.Load(); md != nil && md.deadForView(now) {
+					continue
+				}
 			}
 			n++
 		}

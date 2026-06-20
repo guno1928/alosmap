@@ -87,7 +87,7 @@ func (m *TypedMap[K, V]) Peek(key K) (V, bool) {
 		var zero V
 		return zero, false
 	}
-	return fromBits[V](e.bits.Load()), true
+	return m.loadVal(e), true
 }
 
 // StoreWithTTL sets key to val with a time-to-live; the entry becomes invisible
@@ -121,14 +121,14 @@ func (m *TypedMap[K, V]) SetWithTTLAndHits(key K, val V, ttl time.Duration, hits
 
 func (m *TypedMap[K, V]) putMeta(key K, val V, md *typedMeta) {
 	if md != nil {
+		m.hasMeta.Store(true)
 		m.maybeStartCleaner()
 	}
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
-	bits := toBits(val)
 
 	if e := m.find(s.table.Load(), h, key); e != nil {
-		e.bits.Store(bits)
+		m.storeVal(e, val)
 		e.meta.Store(md)
 		return
 	}
@@ -146,7 +146,7 @@ func (m *TypedMap[K, V]) putMeta(key K, val V, md *typedMeta) {
 			ne := s.newEntry()
 			ne.hash = h
 			ne.key = key
-			ne.bits.Store(bits)
+			m.storeVal(ne, val)
 			ne.meta.Store(md)
 			if firstTomb >= 0 {
 				t.slots[firstTomb].Store(ne)
@@ -162,7 +162,7 @@ func (m *TypedMap[K, V]) putMeta(key K, val V, md *typedMeta) {
 				firstTomb = int(idx)
 			}
 		} else if e.hash == h && e.key == key {
-			e.bits.Store(bits)
+			m.storeVal(e, val)
 			e.meta.Store(md)
 			s.mu.Unlock()
 			return
@@ -184,13 +184,14 @@ func (m *TypedMap[K, V]) LoadOrStoreWithOptions(key K, val V, opt EntryOptions) 
 
 func (m *TypedMap[K, V]) loadOrStoreMeta(key K, val V, md *typedMeta) (V, bool) {
 	if md != nil {
+		m.hasMeta.Store(true)
 		m.maybeStartCleaner()
 	}
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
 	if e := m.find(s.table.Load(), h, key); e != nil {
 		if emd := e.meta.Load(); emd == nil || !emd.deadForView(time.Now().UnixNano()) {
-			return fromBits[V](e.bits.Load()), true
+			return m.loadVal(e), true
 		}
 	}
 
@@ -207,7 +208,7 @@ func (m *TypedMap[K, V]) loadOrStoreMeta(key K, val V, md *typedMeta) (V, bool) 
 			ne := s.newEntry()
 			ne.hash = h
 			ne.key = key
-			ne.bits.Store(toBits(val))
+			m.storeVal(ne, val)
 			ne.meta.Store(md)
 			if firstTomb >= 0 {
 				t.slots[firstTomb].Store(ne)
@@ -224,11 +225,11 @@ func (m *TypedMap[K, V]) loadOrStoreMeta(key K, val V, md *typedMeta) (V, bool) 
 			}
 		} else if e.hash == h && e.key == key {
 			if emd := e.meta.Load(); emd == nil || !emd.deadForView(time.Now().UnixNano()) {
-				v := fromBits[V](e.bits.Load())
+				v := m.loadVal(e)
 				s.mu.Unlock()
 				return v, true
 			}
-			e.bits.Store(toBits(val))
+			m.storeVal(e, val)
 			e.meta.Store(md)
 			s.mu.Unlock()
 			return val, false
@@ -250,11 +251,11 @@ func (m *TypedMap[K, V]) SwapWithOptions(key K, val V, opt EntryOptions) (V, boo
 
 func (m *TypedMap[K, V]) swapMeta(key K, val V, md *typedMeta) (V, bool) {
 	if md != nil {
+		m.hasMeta.Store(true)
 		m.maybeStartCleaner()
 	}
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
-	bits := toBits(val)
 
 	s.mu.Lock()
 	t := s.table.Load()
@@ -269,7 +270,7 @@ func (m *TypedMap[K, V]) swapMeta(key K, val V, md *typedMeta) (V, bool) {
 			ne := s.newEntry()
 			ne.hash = h
 			ne.key = key
-			ne.bits.Store(bits)
+			m.storeVal(ne, val)
 			ne.meta.Store(md)
 			if firstTomb >= 0 {
 				t.slots[firstTomb].Store(ne)
@@ -286,19 +287,19 @@ func (m *TypedMap[K, V]) swapMeta(key K, val V, md *typedMeta) (V, bool) {
 				firstTomb = int(idx)
 			}
 		} else if e.hash == h && e.key == key {
-			prevBits := e.bits.Load()
+			prev := m.loadVal(e)
 			prevDead := false
 			if pmd := e.meta.Load(); pmd != nil && pmd.deadForView(time.Now().UnixNano()) {
 				prevDead = true
 			}
-			e.bits.Store(bits)
+			m.storeVal(e, val)
 			e.meta.Store(md)
 			s.mu.Unlock()
 			if prevDead {
 				var zero V
 				return zero, false
 			}
-			return fromBits[V](prevBits), true
+			return prev, true
 		}
 		idx = (idx + 1) & t.mask
 	}
@@ -317,6 +318,7 @@ func (m *TypedMap[K, V]) CompareAndSwapWithOptions(key K, old, new V, opt EntryO
 
 func (m *TypedMap[K, V]) compareAndSwapMeta(key K, old, new V, md *typedMeta) bool {
 	if md != nil {
+		m.hasMeta.Store(true)
 		m.maybeStartCleaner()
 	}
 	h := m.hash(key)
@@ -330,10 +332,10 @@ func (m *TypedMap[K, V]) compareAndSwapMeta(key K, old, new V, md *typedMeta) bo
 	if emd := e.meta.Load(); emd != nil && emd.deadForView(time.Now().UnixNano()) {
 		return false
 	}
-	if e.bits.Load() != toBits(old) {
+	if !m.valEqual(e, old) {
 		return false
 	}
-	e.bits.Store(toBits(new))
+	m.storeVal(e, new)
 	e.meta.Store(md)
 	return true
 }
@@ -356,7 +358,7 @@ func (m *TypedMap[K, V]) CompareAndDelete(key K, old V) bool {
 			if emd := e.meta.Load(); emd != nil && emd.deadForView(time.Now().UnixNano()) {
 				return false
 			}
-			if e.bits.Load() != toBits(old) {
+			if !m.valEqual(e, old) {
 				return false
 			}
 			t.slots[idx].Store(m.tomb)
@@ -380,7 +382,7 @@ func (m *TypedMap[K, V]) Snapshot() []TypedPair[K, V] {
 			if md := e.meta.Load(); md != nil && md.deadForView(now) {
 				continue
 			}
-			out = append(out, TypedPair[K, V]{Key: e.key, Value: fromBits[V](e.bits.Load())})
+			out = append(out, TypedPair[K, V]{Key: e.key, Value: m.loadVal(e)})
 		}
 	}
 	return out
@@ -408,7 +410,7 @@ func (m *TypedMap[K, V]) RangePar(visitor func(key K, value V) bool) {
 				if md := e.meta.Load(); md != nil && md.deadForView(now) {
 					continue
 				}
-				if !visitor(e.key, fromBits[V](e.bits.Load())) {
+				if !visitor(e.key, m.loadVal(e)) {
 					stop.Store(true)
 					return
 				}

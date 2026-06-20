@@ -6,7 +6,7 @@ import (
 
 	"github.com/guno1928/alosmap"
 	cmap "github.com/orcaman/concurrent-map/v2"
-	"github.com/puzpuzpuz/xsync/v3"
+	"github.com/puzpuzpuz/xsync/v4"
 )
 
 func BenchmarkX_Insert(b *testing.B) {
@@ -102,13 +102,13 @@ func BenchmarkX_Insert(b *testing.B) {
 
 	b.Run("xsync", func(b *testing.B) {
 		b.ReportAllocs()
-		m := xsync.NewMapOf[string, int64](xsync.WithPresize(benchN))
+		m := xsync.NewMap[string, int64](xsync.WithPresize(benchN))
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			m.Store(keys[i%benchN], int64(i))
 			if (i+1)%benchN == 0 {
 				b.StopTimer()
-				m = xsync.NewMapOf[string, int64](xsync.WithPresize(benchN))
+				m = xsync.NewMap[string, int64](xsync.WithPresize(benchN))
 				b.StartTimer()
 			}
 		}
@@ -782,7 +782,7 @@ func BenchmarkX_HotKeyRead(b *testing.B) {
 	})
 
 	b.Run("xsync", func(b *testing.B) {
-		m := xsync.NewMapOf[string, int64]()
+		m := xsync.NewMap[string, int64]()
 		m.Store(hot, 42)
 		b.ReportAllocs()
 		b.ResetTimer()

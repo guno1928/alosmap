@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/guno1928/alosmap v0.0.0
 	github.com/orcaman/concurrent-map/v2 v2.0.1
-	github.com/puzpuzpuz/xsync/v3 v3.5.1
+	github.com/puzpuzpuz/xsync/v4 v4.5.0
 )
 
 require (
