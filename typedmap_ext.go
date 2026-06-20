@@ -120,6 +120,9 @@ func (m *TypedMap[K, V]) SetWithTTLAndHits(key K, val V, ttl time.Duration, hits
 }
 
 func (m *TypedMap[K, V]) putMeta(key K, val V, md *typedMeta) {
+	if md != nil {
+		m.maybeStartCleaner()
+	}
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
 	bits := toBits(val)
@@ -180,6 +183,9 @@ func (m *TypedMap[K, V]) LoadOrStoreWithOptions(key K, val V, opt EntryOptions) 
 }
 
 func (m *TypedMap[K, V]) loadOrStoreMeta(key K, val V, md *typedMeta) (V, bool) {
+	if md != nil {
+		m.maybeStartCleaner()
+	}
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
 	if e := m.find(s.table.Load(), h, key); e != nil {
@@ -243,6 +249,9 @@ func (m *TypedMap[K, V]) SwapWithOptions(key K, val V, opt EntryOptions) (V, boo
 }
 
 func (m *TypedMap[K, V]) swapMeta(key K, val V, md *typedMeta) (V, bool) {
+	if md != nil {
+		m.maybeStartCleaner()
+	}
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
 	bits := toBits(val)
@@ -307,6 +316,9 @@ func (m *TypedMap[K, V]) CompareAndSwapWithOptions(key K, old, new V, opt EntryO
 }
 
 func (m *TypedMap[K, V]) compareAndSwapMeta(key K, old, new V, md *typedMeta) bool {
+	if md != nil {
+		m.maybeStartCleaner()
+	}
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
 	s.mu.Lock()
@@ -431,6 +443,24 @@ func (m *TypedMap[K, V]) CleanupNow() {
 		s := &m.shards[i]
 		s.mu.Lock()
 		old := s.table.Load()
+		reclaimable := false
+		for j := range old.slots {
+			e := old.slots[j].Load()
+			if e == m.tomb {
+				reclaimable = true
+				break
+			}
+			if e != nil {
+				if md := e.meta.Load(); md != nil && md.deadForView(now) {
+					reclaimable = true
+					break
+				}
+			}
+		}
+		if !reclaimable {
+			s.mu.Unlock()
+			continue
+		}
 		nt := &typedTable[K]{
 			slots: make([]atomic.Pointer[typedEntry[K]], len(old.slots)),
 			mask:  old.mask,
@@ -455,9 +485,19 @@ func (m *TypedMap[K, V]) CleanupNow() {
 	}
 }
 
-// Close is a no-op kept for API parity with Map; TypedMap has no background
-// goroutine. The map stays fully usable after Close.
-func (m *TypedMap[K, V]) Close() {}
+// Close stops the background cleanup goroutine, if one was started. It is safe to
+// call multiple times and leaves the map fully usable for reads and writes.
+func (m *TypedMap[K, V]) Close() {
+	if m.cleanupInterval <= 0 {
+		return
+	}
+	if m.cleanupClosed.CompareAndSwap(false, true) {
+		close(m.stopCleanup)
+		if m.cleanerStarted.Load() {
+			<-m.cleanupDone
+		}
+	}
+}
 
 // Stats returns a point-in-time view of occupancy across all shards.
 func (m *TypedMap[K, V]) Stats() TypedStats {

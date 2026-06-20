@@ -21,6 +21,12 @@ type TypedMap[K comparable, V any] struct {
 	shardMask uint64
 	tomb      *typedEntry[K]
 	shards    []typedShard[K]
+
+	cleanupInterval time.Duration
+	cleanerStarted  atomic.Bool
+	cleanupClosed   atomic.Bool
+	stopCleanup     chan struct{}
+	cleanupDone     chan struct{}
 }
 
 type typedShard[K comparable] struct {
@@ -67,8 +73,13 @@ func fromBits[V any](b uint64) V {
 //
 //	m := alosmap.NewTyped[int64, *Session]()
 //	m.Store(42, &Session{})
-func NewTyped[K comparable, V any]() *TypedMap[K, V] {
-	return NewTypedSized[K, V](64, 0)
+func NewTyped[K comparable, V any](opts ...Option) *TypedMap[K, V] {
+	cfg := defaultConfig()
+	cfg.capacity = 64
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return newTypedFromConfig[K, V](cfg)
 }
 
 // NewTypedSized returns an empty TypedMap pre-sized for capacity entries spread
@@ -85,21 +96,30 @@ func NewTyped[K comparable, V any]() *TypedMap[K, V] {
 //
 // V must be no wider than 8 bytes; a larger value type panics at construction —
 // use a pointer instead.
-func NewTypedSized[K comparable, V any](capacity, shardCount int) *TypedMap[K, V] {
+func NewTypedSized[K comparable, V any](capacity, shardCount int, opts ...Option) *TypedMap[K, V] {
+	cfg := defaultConfig()
+	for _, o := range opts {
+		o(&cfg)
+	}
+	cfg.capacity = capacity
+	cfg.shardCount = shardCount
+	return newTypedFromConfig[K, V](cfg)
+}
+
+func newTypedFromConfig[K comparable, V any](cfg config) *TypedMap[K, V] {
 	var zero V
 	if unsafe.Sizeof(zero) > 8 {
 		panic("alosmap: TypedMap value type V must be <= 8 bytes; use a pointer (*T) for larger structs")
 	}
-	if shardCount <= 0 {
-		shardCount = autoShardCount(capacity)
-	}
-	shardCount = nextPowerOfTwo(shardCount)
-	perShard := nextPowerOfTwo(maxInt(8, capacity/shardCount*2))
+	cfg.normalize()
+	shardCount := cfg.shardCount
+	perShard := nextPowerOfTwo(maxInt(8, cfg.capacity/shardCount*2))
 	m := &TypedMap[K, V]{
-		seed:      maphash.MakeSeed(),
-		shardMask: uint64(shardCount - 1),
-		tomb:      &typedEntry[K]{},
-		shards:    make([]typedShard[K], shardCount),
+		seed:            maphash.MakeSeed(),
+		shardMask:       uint64(shardCount - 1),
+		tomb:            &typedEntry[K]{},
+		shards:          make([]typedShard[K], shardCount),
+		cleanupInterval: cfg.cleanupInterval,
 	}
 	for i := range m.shards {
 		t := &typedTable[K]{
@@ -108,7 +128,34 @@ func NewTypedSized[K comparable, V any](capacity, shardCount int) *TypedMap[K, V
 		}
 		m.shards[i].table.Store(t)
 	}
+	if m.cleanupInterval > 0 {
+		m.stopCleanup = make(chan struct{})
+		m.cleanupDone = make(chan struct{})
+	}
 	return m
+}
+
+func (m *TypedMap[K, V]) maybeStartCleaner() {
+	if m.cleanupInterval <= 0 {
+		return
+	}
+	if m.cleanerStarted.CompareAndSwap(false, true) {
+		go m.cleanupLoop()
+	}
+}
+
+func (m *TypedMap[K, V]) cleanupLoop() {
+	ticker := time.NewTicker(m.cleanupInterval)
+	defer ticker.Stop()
+	defer close(m.cleanupDone)
+	for {
+		select {
+		case <-ticker.C:
+			m.CleanupNow()
+		case <-m.stopCleanup:
+			return
+		}
+	}
 }
 
 // Prealloc enables chunked allocation of entry nodes and returns the map for

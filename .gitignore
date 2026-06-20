@@ -18,6 +18,7 @@
 !/typedmap_ext.go
 !/typedmap_ext_test.go
 !/typedmap_testall.go
+!/typedmap_exttestall.go
 !/testall.go
 !/testall_test.go
 !/iface_amd64.go

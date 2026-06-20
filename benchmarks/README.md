@@ -68,10 +68,27 @@ go test -run '^$' -bench . -benchmem -benchtime=150ms -count=3 | tee results/ben
 | Benchmark | Shows |
 |---|---|
 | `BenchmarkAlos_AnyVsTyped`      | `any` map vs `TypedMap` store/load |
-| `BenchmarkAlos_TTL`             | `StoreWithTTL` / `StoreWithHits` / `StoreWithTTLAndHits` |
+| `BenchmarkAlos_TTL`             | `any` map `StoreWithTTL` / `StoreWithHits` / `StoreWithTTLAndHits` |
 | `BenchmarkAlos_ShardScaling`    | parallel read at 1 → 1024 shards |
 | `BenchmarkAlos_CapacityScaling` | parallel read at 64 → 262 144 entries |
 | `BenchmarkAlos_LoadedPointer`   | `atomic.Int64.Add` / `atomic.Bool.Store` / `atomic.Value.Store` / `StringSet` via a loaded pointer |
+
+`BenchmarkTypedExt_*` — the `TypedMap` lifecycle / atomic API added for parity
+with the `any` map:
+
+| Benchmark | Method |
+|---|---|
+| `BenchmarkTypedExt_LoadOrStore_Hit` | `LoadOrStore` (existing key) |
+| `BenchmarkTypedExt_Swap`            | `Swap` |
+| `BenchmarkTypedExt_CompareAndSwap`  | `CompareAndSwap` (success) |
+| `BenchmarkTypedExt_CompareAndDelete`| `CompareAndDelete` + re-store |
+| `BenchmarkTypedExt_Has` / `_Peek` / `_Get` | `Has` / `Peek` / `Get` |
+| `BenchmarkTypedExt_StoreWithTTL` / `_StoreWithHits` / `_StoreWithTTLAndHits` | TTL / hit-limited stores |
+| `BenchmarkTypedExt_Snapshot`        | `Snapshot` (8 192 entries) |
+| `BenchmarkTypedExt_RangePar`        | `RangePar` (8 192 entries) |
+| `BenchmarkTypedExt_Stats`           | `Stats` |
+| `BenchmarkTypedExt_CleanupNow`      | `CleanupNow` (table rebuild) |
+| `BenchmarkTypedExt_Clear`           | `Clear` (refill excluded via timer) |
 
 ## Reading the results
 

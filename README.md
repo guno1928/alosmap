@@ -10,10 +10,13 @@ go get github.com/guno1928/alosmap
 
 ## Test Suite
 
-`testall.go` holds the large registered case list for the package, and `typedmap_testall.go` adds
-300 dedicated `TypedMap[K, V]` cases (IDs 301–600) covering round-trips across key/value types,
+`testall.go` holds the large registered case list for the package. `typedmap_testall.go` adds
+300 `TypedMap[K, V]` cases (IDs 301–600) covering round-trips across key/value types,
 delete/probe-chain integrity, `Range`/`Len`, pointer identity, `Prealloc`, table growth, tombstone
-reuse, and concurrent torn-read stress. Run the full registry through the `TestAllCases` harness with:
+reuse, and concurrent torn-read stress, and `typedmap_exttestall.go` adds 200 more (IDs 601–800)
+for the full lifecycle/atomic API — `LoadOrStore`, `Swap`, `CompareAndSwap`/`CompareAndDelete`,
+`Has`/`Peek`/`Get`, TTL- and hit-limited stores, `Snapshot`, `RangePar`, `Clear`, `Stats`, and
+background cleanup. Run the full registry through the `TestAllCases` harness with:
 
 ```bash
 go test -run TestAllCases -count=1 -v
@@ -27,7 +30,7 @@ go test -count=1 ./...
 
 Latest local run in this repo:
 
-- `TestAllCases`: `575/575` cases passed (275 core + 300 `TypedMap` cases)
+- `TestAllCases`: `775/775` cases passed (275 core + 500 `TypedMap` cases)
 - Typed map, prealloc, and concurrency/race suites pass (`-race` clean)
 - Full package suite: `ok github.com/guno1928/alosmap`
 
@@ -1253,8 +1256,15 @@ fmt.Println(m.Has(alosmap.I(3))) // false
 | `New(options ...Option) *Map` | Construct an any-value map with functional options |
 | `NewBuilder() *Builder` | Construct an any-value map with the fluent builder |
 | `RecommendedShardCount(n int) int` | Reuse the package's shard heuristic for explicit sizing |
-| `NewTyped[K comparable, V any]() *TypedMap[K,V]` | Construct a typed map (V ≤ 8 bytes; use `*T` for larger) |
-| `NewTypedSized[K, V](capacity, shards int) *TypedMap[K,V]` | Typed map with explicit sizing |
+| `NewTyped[K comparable, V any](opts ...Option) *TypedMap[K,V]` | Construct a typed map (V ≤ 8 bytes; use `*T` for larger) |
+| `NewTypedSized[K, V](capacity, shards int, opts ...Option) *TypedMap[K,V]` | Typed map with explicit sizing |
+
+`TypedMap` accepts the same functional options as `New` — most usefully
+`WithCleanupInterval(d)` and `WithoutCleanup()`. Like the `any` map it runs a
+**background cleaner by default** (5s) that reclaims expired / hit-exhausted
+entries; the goroutine only starts once the first TTL/hit entry is stored, so a
+typed map used purely as a plain map never spawns one. Pass `WithoutCleanup()`
+to disable it, and call `Close()` to stop it.
 
 ### Options
 
@@ -1299,8 +1309,8 @@ path keeps the typed map's speed.
 | `tm.Len() int` | Live entry count |
 | `tm.Stats() TypedStats` | Occupancy snapshot |
 | `tm.Clear()` | Remove all entries |
-| `tm.CleanupNow()` | Reclaim expired / hit-exhausted / tombstoned slots |
-| `tm.Close()` | No-op (TypedMap has no background goroutine) |
+| `tm.CleanupNow()` | Reclaim expired / hit-exhausted / tombstoned slots now |
+| `tm.Close()` | Stop the background cleaner (idempotent; map stays usable) |
 | `tm.Prealloc(chunk) *TypedMap[K,V]` | Turn on chunked allocation (fluent) |
 
 ### Key Constructors and Methods
