@@ -301,7 +301,7 @@ func (s *typedShard[K]) usedApprox(t *typedTable[K]) int {
 
 func (m *TypedMap[K, V]) find(t *typedTable[K], h uint64, key K) *typedEntry[K] {
 	idx := h & t.mask
-	for {
+	for probes := 0; probes < len(t.slots); probes++ {
 		e := t.slots[idx].Load()
 		if e == nil {
 			return nil
@@ -311,6 +311,7 @@ func (m *TypedMap[K, V]) find(t *typedTable[K], h uint64, key K) *typedEntry[K] 
 		}
 		idx = (idx + 1) & t.mask
 	}
+	return nil
 }
 
 // Load returns the value stored for key and true, or the zero V and false when
@@ -373,11 +374,23 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 	t := s.table.Load()
 	if used := s.usedApprox(t); gen&1 == 0 && (used+1)*4 < len(t.slots)*3 {
 		idx := h & t.mask
+		firstTomb := -1
 		for i := 0; i < 8; i++ {
 			e := t.slots[idx].Load()
 			if e == nil {
 				ne := &typedEntry[K]{hash: h, key: key}
 				m.storeVal(ne, val)
+				if firstTomb >= 0 {
+					if t.slots[uint64(firstTomb)].CompareAndSwap(m.tomb, ne) {
+						atomic.AddInt64(&t.tombstones, -1)
+						atomic.AddInt64(&t.count, 1)
+						if s.table.Load() != t || atomic.LoadInt64(&s.resizeGen) != gen {
+							m.repairInsert(s, h, key, val)
+						}
+						return
+					}
+					break
+				}
 				if t.slots[idx].CompareAndSwap(nil, ne) {
 					atomic.AddInt64(&t.count, 1)
 					if s.table.Load() != t || atomic.LoadInt64(&s.resizeGen) != gen {
@@ -387,7 +400,11 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 				}
 				break
 			}
-			if e != m.tomb && e.hash == h && e.key == key {
+			if e == m.tomb {
+				if firstTomb < 0 {
+					firstTomb = int(idx)
+				}
+			} else if e.hash == h && e.key == key {
 				m.storeVal(e, val)
 				if m.hasMeta.Load() && e.meta.Load() != nil {
 					e.meta.Store(nil)
@@ -548,7 +565,7 @@ func (m *TypedMap[K, V]) Delete(key K) (V, bool) {
 	s.mu.Lock()
 	t := s.table.Load()
 	idx := h & t.mask
-	for {
+	for probes := 0; probes < len(t.slots); probes++ {
 		e := t.slots[idx].Load()
 		if e == nil {
 			s.mu.Unlock()
@@ -573,6 +590,9 @@ func (m *TypedMap[K, V]) Delete(key K) (V, bool) {
 		}
 		idx = (idx + 1) & t.mask
 	}
+	s.mu.Unlock()
+	var zero V
+	return zero, false
 }
 
 // Range calls visitor for each live key/value pair, stopping early if visitor

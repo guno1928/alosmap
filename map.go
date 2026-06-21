@@ -18,6 +18,7 @@ const (
 	defaultCapacity               = 1024
 	defaultLoadFactor             = 0.72
 	defaultShardMultiplier        = 4
+	defaultShardCount             = 32
 	defaultCleanupInterval        = 5 * time.Second
 	largeScaleCapacity            = 1_000_000
 	veryLargeScaleCapacity        = 10_000_000
@@ -203,9 +204,8 @@ type config struct {
 // than 1 are normalized to the default. Capacity influences initial allocation and
 // resize behavior only; it is not a hard maximum.
 //
-// Shards is optional. Default: automatic heuristic based on expected capacity and
-// GOMAXPROCS. Constraint: positive values are rounded up to the next power of two;
-// zero or negative values trigger automatic selection.
+// Shards is optional. Default: 32. Constraint: positive values are rounded up to the
+// next power of two; zero or negative values use the default.
 //
 // LoadFactor is optional. Default: 0.72. Constraint: values below 0.50 are clamped
 // to 0.50 and values above 0.90 are clamped to 0.90.
@@ -445,7 +445,7 @@ func (b *Builder) Capacity(capacity int) *Builder {
 // Shards sets the requested shard count for the map.
 //
 // This setting is optional. Positive values are rounded up to the next power of two.
-// Zero and negative values tell Build to use the package's shard-selection heuristic.
+// Zero and negative values tell Build to use the default of 32.
 // More shards can reduce cross-key write contention at the cost of extra overhead.
 func (b *Builder) Shards(count int) *Builder {
 	b.cfg.shardCount = count
@@ -552,7 +552,7 @@ func WithCapacity(capacity int) Option {
 // WithShardCount returns an Option that sets the requested shard count.
 //
 // The option is optional. Positive values are rounded up to the next power of two.
-// Zero and negative values cause New to choose the shard count automatically.
+// Zero and negative values cause New to use the default of 32.
 func WithShardCount(count int) Option {
 	return func(cfg *config) {
 		cfg.shardCount = count
@@ -604,13 +604,13 @@ func WithValueCloner(cloner ValueCloneFunc) Option {
 // All options are optional. When omitted, New uses these defaults:
 //
 //	Capacity: 1024 expected live entries.
-//	Shard count: selected automatically from expected capacity and GOMAXPROCS.
+//	Shard count: 32.
 //	Load factor: 0.72.
 //	Cleanup interval: 5 seconds.
 //	Value cloner: pass-through storage with zero tracked value bytes.
 //
 // Option values are normalized before construction. Capacity values below 1 fall
-// back to the default, shard counts are rounded to a power of two or auto-selected,
+// back to the default, shard counts are rounded to a power of two or default to 32,
 // load factor is clamped to [0.50, 0.90], and negative cleanup intervals are treated
 // as 0.
 func New(options ...Option) *Map {
@@ -675,7 +675,7 @@ func (cfg *config) normalize() {
 		cfg.loadFactor = 0.90
 	}
 	if cfg.shardCount <= 0 {
-		cfg.shardCount = autoShardCount(cfg.capacity)
+		cfg.shardCount = defaultShardCount
 	} else {
 		cfg.shardCount = nextPowerOfTwo(cfg.shardCount)
 	}
@@ -1680,12 +1680,10 @@ func (s *shard) loadOrStoreDeferred(hash uint64, key Key, value any, options Ent
 	currentTable := s.table.Load()
 	idx := int(hash & currentTable.mask)
 	fp := fingerprint(hash)
-	emptyIdx := -1
 	mask := int(currentTable.mask)
 	for probes := 0; probes <= mask; probes++ {
 		c := ctrlLoad(currentTable.ctrl, idx)
 		if c == 0 {
-			emptyIdx = idx
 			break
 		}
 		if c == fp {
@@ -1699,53 +1697,6 @@ func (s *shard) loadOrStoreDeferred(hash uint64, key Key, value any, options Ent
 			}
 		}
 		idx = (idx + 1) & mask
-	}
-
-	if emptyIdx >= 0 {
-		var cloned any
-		var trackedBytes int64
-		if cloneFunc != nil {
-			cloned, trackedBytes = cloneFunc(value)
-		} else {
-			cloned = value
-		}
-		bundle := s.newBundle()
-		bundle.ent.hash = hash
-		bundle.ent.key = cloneKey(key)
-		bundle.box.setVal(cloned)
-		if trackedBytes != 0 || options.Hits > 0 || options.TTL > 0 {
-			meta := &valueMeta{clonedBytes: trackedBytes}
-			if options.Hits > 0 {
-				meta.hits.Store(options.Hits)
-			}
-			if options.TTL > 0 {
-				meta.expiresAt = time.Now().Add(options.TTL).UnixNano()
-			}
-			bundle.box.meta = meta
-		}
-		bundle.ent.value.Store(&bundle.box)
-
-		if currentTable.slots[emptyIdx].entry.CompareAndSwap(nil, &bundle.ent) {
-			ctrlStore(currentTable.ctrl, emptyIdx, fp)
-			if s.table.Load() == currentTable {
-				s.live.Add(1)
-				used := s.used.Add(1)
-				s.keyBytes.Add(keySize(key))
-				if trackedBytes > 0 {
-					s.valueBytes.Add(trackedBytes)
-				}
-				if bundle.box.requiresCleanup() {
-					s.needsCleanup.Store(true)
-				}
-				if used >= int64(currentTable.growAt) {
-					s.resize(int(s.live.Load()) + 1)
-				}
-				return cloned, false
-			}
-			if findEntry(s.table.Load(), hash, key) == &bundle.ent {
-				return cloned, false
-			}
-		}
 	}
 
 	return s.loadOrStoreSlow(hash, key, value, options, cloneFunc)
