@@ -295,10 +295,6 @@ func (m *TypedMap[K, V]) hash(key K) uint64 {
 	}
 }
 
-func (s *typedShard[K]) usedApprox(t *typedTable[K]) int {
-	return int(atomic.LoadInt64(&t.count) + atomic.LoadInt64(&t.tombstones))
-}
-
 func (m *TypedMap[K, V]) find(t *typedTable[K], h uint64, key K) *typedEntry[K] {
 	idx := h & t.mask
 	for probes := 0; probes < len(t.slots); probes++ {
@@ -370,53 +366,8 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 		return
 	}
 
-	gen := atomic.LoadInt64(&s.resizeGen)
-	t := s.table.Load()
-	if used := s.usedApprox(t); gen&1 == 0 && (used+1)*4 < len(t.slots)*3 {
-		idx := h & t.mask
-		firstTomb := -1
-		for i := 0; i < 8; i++ {
-			e := t.slots[idx].Load()
-			if e == nil {
-				ne := &typedEntry[K]{hash: h, key: key}
-				m.storeVal(ne, val)
-				if firstTomb >= 0 {
-					if t.slots[uint64(firstTomb)].CompareAndSwap(m.tomb, ne) {
-						atomic.AddInt64(&t.tombstones, -1)
-						atomic.AddInt64(&t.count, 1)
-						if s.table.Load() != t || atomic.LoadInt64(&s.resizeGen) != gen {
-							m.repairInsert(s, h, key, val)
-						}
-						return
-					}
-					break
-				}
-				if t.slots[idx].CompareAndSwap(nil, ne) {
-					atomic.AddInt64(&t.count, 1)
-					if s.table.Load() != t || atomic.LoadInt64(&s.resizeGen) != gen {
-						m.repairInsert(s, h, key, val)
-					}
-					return
-				}
-				break
-			}
-			if e == m.tomb {
-				if firstTomb < 0 {
-					firstTomb = int(idx)
-				}
-			} else if e.hash == h && e.key == key {
-				m.storeVal(e, val)
-				if m.hasMeta.Load() && e.meta.Load() != nil {
-					e.meta.Store(nil)
-				}
-				return
-			}
-			idx = (idx + 1) & t.mask
-		}
-	}
-
 	s.mu.Lock()
-	t = s.table.Load()
+	t := s.table.Load()
 	used := int(atomic.LoadInt64(&t.count) + atomic.LoadInt64(&t.tombstones))
 	if (used+1)*4 >= len(t.slots)*3 {
 		t = m.growLocked(s, t)
@@ -456,40 +407,6 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 			if e.meta.Load() != nil {
 				e.meta.Store(nil)
 			}
-			s.mu.Unlock()
-			return
-		}
-		idx = (idx + 1) & t.mask
-	}
-}
-
-func (m *TypedMap[K, V]) repairInsert(s *typedShard[K], h uint64, key K, val V) {
-	s.mu.Lock()
-	t := s.table.Load()
-	idx := h & t.mask
-	firstTomb := -1
-	for {
-		e := t.slots[idx].Load()
-		if e == nil {
-			ne := &typedEntry[K]{hash: h, key: key}
-			m.storeVal(ne, val)
-			if firstTomb >= 0 {
-				t.slots[firstTomb].Store(ne)
-				atomic.AddInt64(&t.tombstones, -1)
-				atomic.AddInt64(&t.count, 1)
-			} else {
-				t.slots[idx].Store(ne)
-				atomic.AddInt64(&t.count, 1)
-			}
-			s.mu.Unlock()
-			return
-		}
-		if e == m.tomb {
-			if firstTomb < 0 {
-				firstTomb = int(idx)
-			}
-		} else if e.hash == h && e.key == key {
-			m.storeVal(e, val)
 			s.mu.Unlock()
 			return
 		}
