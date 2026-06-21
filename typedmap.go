@@ -35,19 +35,22 @@ type TypedMap[K comparable, V any] struct {
 }
 
 type typedShard[K comparable] struct {
-	table atomic.Pointer[typedTable[K]]
-	_     [56]byte
-	mu    sync.Mutex
-	chunk []typedEntry[K]
-	off   int
-	depth int
-	_     [16]byte
+	table     atomic.Pointer[typedTable[K]]
+	resizeGen int64
+	_         [32]byte
+	mu        sync.Mutex
+	chunk     []typedEntry[K]
+	off       int
+	depth     int
+	_         [16]byte
 }
 
 type typedTable[K comparable] struct {
-	slots []atomic.Pointer[typedEntry[K]]
-	mask  uint64
-	count int
+	slots      []atomic.Pointer[typedEntry[K]]
+	mask       uint64
+	_          [40]byte
+	count      int64
+	tombstones int64
 }
 
 type typedEntry[K comparable] struct {
@@ -292,6 +295,10 @@ func (m *TypedMap[K, V]) hash(key K) uint64 {
 	}
 }
 
+func (s *typedShard[K]) usedApprox(t *typedTable[K]) int {
+	return int(atomic.LoadInt64(&t.count) + atomic.LoadInt64(&t.tombstones))
+}
+
 func (m *TypedMap[K, V]) find(t *typedTable[K], h uint64, key K) *typedEntry[K] {
 	idx := h & t.mask
 	for {
@@ -362,9 +369,39 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 		return
 	}
 
-	s.mu.Lock()
+	gen := atomic.LoadInt64(&s.resizeGen)
 	t := s.table.Load()
-	if (t.count+1)*4 >= len(t.slots)*3 {
+	if used := s.usedApprox(t); gen&1 == 0 && (used+1)*4 < len(t.slots)*3 {
+		idx := h & t.mask
+		for i := 0; i < 8; i++ {
+			e := t.slots[idx].Load()
+			if e == nil {
+				ne := &typedEntry[K]{hash: h, key: key}
+				m.storeVal(ne, val)
+				if t.slots[idx].CompareAndSwap(nil, ne) {
+					atomic.AddInt64(&t.count, 1)
+					if s.table.Load() != t || atomic.LoadInt64(&s.resizeGen) != gen {
+						m.repairInsert(s, h, key, val)
+					}
+					return
+				}
+				break
+			}
+			if e != m.tomb && e.hash == h && e.key == key {
+				m.storeVal(e, val)
+				if m.hasMeta.Load() && e.meta.Load() != nil {
+					e.meta.Store(nil)
+				}
+				return
+			}
+			idx = (idx + 1) & t.mask
+		}
+	}
+
+	s.mu.Lock()
+	t = s.table.Load()
+	used := int(atomic.LoadInt64(&t.count) + atomic.LoadInt64(&t.tombstones))
+	if (used+1)*4 >= len(t.slots)*3 {
 		t = m.growLocked(s, t)
 	}
 	idx := h & t.mask
@@ -377,13 +414,21 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 			ne.key = key
 			m.storeVal(ne, val)
 			if firstTomb >= 0 {
-				t.slots[firstTomb].Store(ne)
-			} else {
-				t.slots[idx].Store(ne)
-				t.count++
+				if t.slots[firstTomb].CompareAndSwap(m.tomb, ne) {
+					atomic.AddInt64(&t.tombstones, -1)
+					atomic.AddInt64(&t.count, 1)
+					s.mu.Unlock()
+					return
+				}
+				firstTomb = -1
+				continue
 			}
-			s.mu.Unlock()
-			return
+			if t.slots[idx].CompareAndSwap(nil, ne) {
+				atomic.AddInt64(&t.count, 1)
+				s.mu.Unlock()
+				return
+			}
+			continue
 		}
 		if e == m.tomb {
 			if firstTomb < 0 {
@@ -394,6 +439,61 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 			if e.meta.Load() != nil {
 				e.meta.Store(nil)
 			}
+			s.mu.Unlock()
+			return
+		}
+		idx = (idx + 1) & t.mask
+	}
+}
+
+func (m *TypedMap[K, V]) repairInsert(s *typedShard[K], h uint64, key K, val V) {
+	s.mu.Lock()
+	t := s.table.Load()
+	idx := h & t.mask
+	firstTomb := -1
+	for {
+		e := t.slots[idx].Load()
+		if e == nil {
+			ne := &typedEntry[K]{hash: h, key: key}
+			m.storeVal(ne, val)
+			if firstTomb >= 0 {
+				t.slots[firstTomb].Store(ne)
+				atomic.AddInt64(&t.tombstones, -1)
+				atomic.AddInt64(&t.count, 1)
+			} else {
+				t.slots[idx].Store(ne)
+				atomic.AddInt64(&t.count, 1)
+			}
+			s.mu.Unlock()
+			return
+		}
+		if e == m.tomb {
+			if firstTomb < 0 {
+				firstTomb = int(idx)
+			}
+		} else if e.hash == h && e.key == key {
+			m.storeVal(e, val)
+			s.mu.Unlock()
+			return
+		}
+		idx = (idx + 1) & t.mask
+	}
+}
+
+func (m *TypedMap[K, V]) repairDelete(s *typedShard[K], h uint64, key K) {
+	s.mu.Lock()
+	t := s.table.Load()
+	idx := h & t.mask
+	for {
+		e := t.slots[idx].Load()
+		if e == nil {
+			s.mu.Unlock()
+			return
+		}
+		if e != m.tomb && e.hash == h && e.key == key {
+			t.slots[idx].Store(m.tomb)
+			atomic.AddInt64(&t.count, -1)
+			atomic.AddInt64(&t.tombstones, 1)
 			s.mu.Unlock()
 			return
 		}
@@ -414,6 +514,37 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 func (m *TypedMap[K, V]) Delete(key K) (V, bool) {
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
+
+	if !m.hasMeta.Load() {
+		gen := atomic.LoadInt64(&s.resizeGen)
+		t := s.table.Load()
+		if gen&1 == 0 {
+			idx := h & t.mask
+			for i := 0; i < 8; i++ {
+				e := t.slots[idx].Load()
+				if e == nil {
+					var zero V
+					return zero, false
+				}
+				if e != m.tomb && e.hash == h && e.key == key {
+					if e.meta.Load() == nil {
+						v := m.loadVal(e)
+						if t.slots[idx].CompareAndSwap(e, m.tomb) {
+							atomic.AddInt64(&t.count, -1)
+							atomic.AddInt64(&t.tombstones, 1)
+							if s.table.Load() != t || atomic.LoadInt64(&s.resizeGen) != gen {
+								m.repairDelete(s, h, key)
+							}
+							return v, true
+						}
+					}
+					break
+				}
+				idx = (idx + 1) & t.mask
+			}
+		}
+	}
+
 	s.mu.Lock()
 	t := s.table.Load()
 	idx := h & t.mask
@@ -431,6 +562,8 @@ func (m *TypedMap[K, V]) Delete(key K) (V, bool) {
 				dead = true
 			}
 			t.slots[idx].Store(m.tomb)
+			atomic.AddInt64(&t.count, -1)
+			atomic.AddInt64(&t.tombstones, 1)
 			s.mu.Unlock()
 			if dead {
 				var zero V
@@ -510,11 +643,22 @@ func (m *TypedMap[K, V]) Len() int {
 	return n
 }
 
-func (m *TypedMap[K, V]) growLocked(s *typedShard[K], old *typedTable[K]) *typedTable[K] {
-	nt := &typedTable[K]{
-		slots: make([]atomic.Pointer[typedEntry[K]], len(old.slots)*2),
-		mask:  uint64(len(old.slots)*2 - 1),
+func targetTypedSlots(curSlots, live, tombstones int) int {
+	required := nextPowerOfTwo(maxInt(8, live*2))
+	if required > curSlots {
+		return maxInt(curSlots*4, required)
 	}
+	return required
+}
+
+func (m *TypedMap[K, V]) growLocked(s *typedShard[K], old *typedTable[K]) *typedTable[K] {
+	atomic.AddInt64(&s.resizeGen, 1)
+	size := targetTypedSlots(len(old.slots), int(atomic.LoadInt64(&old.count)), int(atomic.LoadInt64(&old.tombstones)))
+	nt := &typedTable[K]{
+		slots: make([]atomic.Pointer[typedEntry[K]], size),
+		mask:  uint64(size - 1),
+	}
+	var cnt int64
 	for i := range old.slots {
 		e := old.slots[i].Load()
 		if e == nil || e == m.tomb {
@@ -525,8 +669,11 @@ func (m *TypedMap[K, V]) growLocked(s *typedShard[K], old *typedTable[K]) *typed
 			idx = (idx + 1) & nt.mask
 		}
 		nt.slots[idx].Store(e)
-		nt.count++
+		cnt++
 	}
+	nt.count = cnt
+	nt.tombstones = 0
 	s.table.Store(nt)
+	atomic.AddInt64(&s.resizeGen, 1)
 	return nt
 }
