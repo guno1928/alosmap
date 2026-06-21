@@ -75,14 +75,14 @@ stores (`StoreWithTTL`, `StoreWithHits`, `StoreWithTTLAndHits`, …), `Snapshot`
 only TTL/hit entries allocate a small metadata word, so the hot path keeps the speeds
 below. See [TypedMap Methods](#typedmap-methods) for the full list.
 
-Measured head-to-head, same keys and machine (median of 3, `-benchtime=150ms`):
+Measured head-to-head, same keys and machine (median of 5, `-benchtime=200ms`):
 
 | Operation             | `any` Map      | `TypedMap[K,V]`     | Speedup  |
 |-----------------------|----------------|---------------------|----------|
-| Store (update)        | 30 ns, 1 box   | **18 ns, 0 alloc**  | **1.7×** |
-| Store, parallel (16T) | 6.3 ns         | **3.4 ns, 0 alloc** | **1.9×** |
-| Load                  | 16 ns          | 16 ns               | ~1×      |
-| Load, parallel (16T)  | 2.05 ns        | **1.94 ns**         | 1.06×    |
+| Store (update)        | 31 ns, 1 box   | **15 ns, 0 alloc**  | **2.0×** |
+| Store, parallel (16T) | 6.96 ns        | **3.11 ns, 0 alloc**| **2.2×** |
+| Load                  | 15 ns          | 14 ns               | 1.1×     |
+| Load, parallel (16T)  | 2.01 ns        | **1.74 ns**         | 1.16×    |
 
 `V` must be **≤ 8 bytes** — `int`, `int64`, `float64`, any pointer, or a small struct.
 For larger structs store a pointer (itself 8 bytes), which stays zero-alloc and tear-free:
@@ -123,12 +123,12 @@ Insert throughput vs every other map (single-goroutine fill, 8 192 keys):
 
 | Map               |   ns/op | allocs |
 |-------------------|--------:|-------:|
-| map + RWMutex\*   |  27.1   | 0      |
-| xsync             |  40.5   | 1      |
-| alosmap Typed     |  47.2   | 1      |
-| alosmap (any)     |  94.0   | 2      |
-| cmap              |  95.2   | 0      |
-| sync.Map          | 124.5   | 3      |
+| map + RWMutex\*   |  **27.1** -> 33.4 | 0 |
+| xsync             |  48.6   | 1      |
+| alosmap Typed     |  51.1   | 1      |
+| alosmap (any)     |  93.7   | 2      |
+| cmap              | 106.3   | 0      |
+| sync.Map          | 144.1   | 3      |
 
 On a raw single-thread fill the lock-free maps cluster behind `map + RWMutex`
 (which has zero contention here). Turning on `Prealloc` takes the **typed map's
@@ -136,8 +136,8 @@ inserts to 0 allocations** (the any map keeps 2) by handing out entry nodes in
 chunks instead of one `mallocgc` per key.
 
 \* `map + sync.RWMutex` wins *uncontended single-thread* insert, but it has no
-sharding and **collapses under concurrent writes** (81.6 ns vs the typed map's
-3.4 ns in the parallel write benchmark). The lock-free maps trade a little
+sharding and **collapses under concurrent writes** (84.2 ns vs the typed map's
+3.1 ns in the parallel write benchmark). The lock-free maps trade a little
 single-thread insert speed for surviving real concurrency.
 
 **Choosing the chunk size** — you pick it (10, 128, 256, 1000, …):
@@ -173,7 +173,13 @@ never touch the library). Reproduce on your own hardware with:
 
 ```bash
 cd benchmarks
-go test -run='^$' -bench='BenchmarkX_' -benchmem -benchtime=150ms -count=3
+go test -run='^$' -bench='BenchmarkX_' -benchmem -benchtime=200ms -count=5
+```
+
+```bash
+cd fairbenchmark
+go test -run='^$' -bench='BenchmarkFair_' -benchmem -benchtime=200ms -count=5
+go test -run='TestMemoryFootprint|TestChurnFootprint' -v
 ```
 
 ### Headline scorecard
@@ -184,30 +190,30 @@ ns/op, lower is better, string keys + `int64` values, 16 goroutines.
 
 | Workload          | alosmap | **Typed** | sync.Map | map+RWMutex | xsync   | cmap   |
 |-------------------|--------:|----------:|---------:|------------:|--------:|-------:|
-| Read parallel     |  2.05   |   1.94    |  2.66    |   34.7      | **1.48**| 4.88   |
-| **Write parallel**|  6.29   | **3.39**  | 25.8     |   81.6      | 11.7    | 14.2   |
-| **Mixed 90/10**   |  2.80   | **2.26**  |  5.89    |   96.9      | 3.30    | 17.2   |
-| Delete 50/50      | **5.13**|   5.18    | 15.4     |   74.7      | 8.16    | 13.9   |
-| **Range 16k (µs)**|  65     |  **25**   | 130      |  62         | 59      | 66     |
-| HotKey read       |  1.53   |   1.19    |  1.47    |   33.6      | **1.12**| 33.5   |
+| Read parallel     |  2.01   |   1.74    |  3.30    |   33.6      | **1.33**| 4.90   |
+| **Write parallel**|  6.96   | **3.11**  | 28.5     |   84.2      | 11.6    | 15.3   |
+| **Mixed 90/10**   |  2.90   | **2.19**  |  6.20    |   97.9      | 3.06    | 17.2   |
+| **Delete 50/50**  |  5.00   | **3.17**  | 14.8     |   75.4      | 7.00    | 13.9   |
+| **Range 16k (µs)**|  65     |  **49**   | 128      |  63         | 59      | 66     |
+| HotKey read       |  1.45   |   1.12    |  1.46    |   33.6      | **1.00**| 33.5   |
 
 Honest reading of the numbers:
 
 - **Writes are alosmap's strongest category.** `Typed` is **the fastest map
-  here by far** — ~3.5× faster than xsync, ~7.6× faster than `sync.Map`, with
-  zero allocations. The `any` map is second (6.3 ns), still ~1.9× faster than
+  here by far** — ~3.7× faster than xsync, ~9.2× faster than `sync.Map`, with
+  zero allocations. The `any` map is second (6.96 ns), still ~1.7× faster than
   xsync and ~4× faster than `sync.Map`.
 - **Range is alosmap's other clear win.** `Typed` iterates 16k entries fastest
-  of all (25 µs) — its compact inline entries are a cache-friendly sequential
+  of all (49 µs) — its compact inline entries are a cache-friendly sequential
   scan. The `any` map's parallel-collect pipeline clusters with xsync/cmap and
   iterates *without blocking writers*, unlike builtin+RWMutex.
-- **Reads** are a near-tie at the top: xsync edges it (1.48 ns), `Typed` second
-  (1.94 ns), `any` third (2.05 ns) — all lock-free, all far ahead of `sync.Map`,
+- **Reads** are a near-tie at the top: xsync edges it (1.33 ns), `Typed` second
+  (1.74 ns), `any` third (2.01 ns) — all lock-free, all far ahead of `sync.Map`,
   cmap, and RWMutex.
-- **Delete leads the field** under a 50/50 delete/store mix: both alosmap maps
-  (~5.1 ns) beat xsync (8.2 ns) and cmap (13.9 ns) — tombstone-only deletes keep
-  it close to a plain store. RWMutex is an order of magnitude behind on every
-  contended op.
+- **Delete: Typed now leads the field** under a 50/50 delete/store mix: `Typed`
+  (3.17 ns) is now fastest outright — its delete is lock-free, just CAS-stamps a
+  tombstone — with `any` (5.00 ns) second. Both still beat xsync (7.00 ns) and
+  cmap (13.9 ns). RWMutex is ~10–15× behind.
 - **`map + sync.RWMutex`** — the "just lock it" default — is **10–30× slower**
   than the lock-free maps under contention. The numbers are why this library
   exists.
@@ -221,12 +227,12 @@ For visitors that are safe to call concurrently, the `any` map also exposes
 
 | Map               |   ns/op |    ops/s | allocs |
 |-------------------|--------:|---------:|-------:|
-| **xsync**         | **1.48**| **678 M/s** | 0   |
-| alosmap **Typed** |   1.94  |  514 M/s | 0      |
-| alosmap (any)     |   2.05  |  489 M/s | 0      |
-| sync.Map          |   2.66  |  376 M/s | 0      |
-| cmap              |   4.88  |  205 M/s | 0      |
-| map + RWMutex     |  34.7   | 29.0 M/s | 0      |
+| **xsync**         | **1.33**| **751 M/s** | 0   |
+| alosmap **Typed** |   1.74  |  576 M/s | 0      |
+| alosmap (any)     |   2.01  |  497 M/s | 0      |
+| sync.Map          |   3.30  |  303 M/s | 0      |
+| cmap              |   4.90  |  204 M/s | 0      |
+| map + RWMutex     |  33.6   | 29.8 M/s | 0      |
 
 The three lock-free maps (xsync, Typed, any) cluster at the top; every map that
 takes a lock per read falls off a cliff.
@@ -235,12 +241,12 @@ takes a lock per read falls off a cliff.
 
 | Map               |   ns/op |    ops/s | allocs |
 |-------------------|--------:|---------:|-------:|
-| **xsync**         | **1.12**| **890 M/s** | 0   |
-| alosmap Typed     |   1.19  |  844 M/s | 0      |
-| sync.Map          |   1.47  |  681 M/s | 0      |
-| alosmap (any)     |   1.53  |  656 M/s | 0      |
-| cmap              |  33.5   | 30.0 M/s | 0      |
-| map + RWMutex     |  33.6   | 29.7 M/s | 0      |
+| **xsync**         | **1.00**| **1004 M/s** | 0  |
+| alosmap Typed     |   1.12  |  891 M/s | 0      |
+| alosmap (any)     |   1.45  |  689 M/s | 0      |
+| sync.Map          |   1.46  |  684 M/s | 0      |
+| cmap              |  33.5   | 29.9 M/s | 0      |
+| map + RWMutex     |  33.6   | 29.8 M/s | 0      |
 
 ---
 
@@ -248,16 +254,16 @@ takes a lock per read falls off a cliff.
 
 | Map               |   ns/op |    ops/s | allocs/op |
 |-------------------|--------:|---------:|----------:|
-| **alosmap Typed** | **3.39**| **295 M/s** | **0**  |
-| alosmap (any)     |   6.29  |  159 M/s | 0         |
-| xsync             |  11.7   | 85.0 M/s | 1         |
-| cmap              |  14.2   | 70.0 M/s | 0         |
-| sync.Map          |  25.8   | 38.8 M/s | 2         |
-| map + RWMutex     |  81.6   | 12.3 M/s | 0         |
+| **alosmap Typed** | **3.11**| **321 M/s** | **0**  |
+| alosmap (any)     |   6.96  |  144 M/s | 0         |
+| xsync             |  11.6   | 86 M/s   | 1         |
+| cmap              |  15.3   | 65 M/s   | 0         |
+| sync.Map          |  28.5   | 35 M/s   | 2         |
+| map + RWMutex     |  84.2   | 11.9 M/s | 0         |
 
 Writes are where alosmap pulls away. The typed map stores the value in an atomic
-word with **zero allocations** — ~3.5× faster than xsync and ~7.6× faster than
-`sync.Map`. The `any` map is second, still ~1.9× faster than xsync.
+word with **zero allocations** — ~3.7× faster than xsync and ~9.2× faster than
+`sync.Map`. The `any` map is second, still ~1.7× faster than xsync.
 
 ---
 
@@ -265,27 +271,28 @@ word with **zero allocations** — ~3.5× faster than xsync and ~7.6× faster th
 
 | Map               |   ns/op |    ops/s |
 |-------------------|--------:|---------:|
-| **alosmap Typed** | **2.26**| **442 M/s** |
-| alosmap (any)     |   2.80  |  357 M/s |
-| xsync             |   3.30  |  303 M/s |
-| sync.Map          |   5.89  |  170 M/s |
-| cmap              |  17.2   | 58.0 M/s |
-| map + RWMutex     |  96.9   | 10.3 M/s |
+| **alosmap Typed** | **2.19**| **458 M/s** |
+| alosmap (any)     |   2.90  |  345 M/s |
+| xsync             |   3.06  |  327 M/s |
+| sync.Map          |   6.20  |  161 M/s |
+| cmap              |  17.2   | 58 M/s   |
+| map + RWMutex     |  97.9   | 10.2 M/s |
 
 ### Delete — parallel, 50% delete / 50% store
 
 | Map               |   ns/op |    ops/s |
 |-------------------|--------:|---------:|
-| **alosmap (any)** | **5.13**| **195 M/s** |
-| alosmap Typed     |   5.18  |  193 M/s |
-| xsync             |   8.16  |  123 M/s |
-| cmap              |  13.9   | 72.0 M/s |
-| sync.Map          |  15.4   | 65.0 M/s |
-| map + RWMutex     |  74.7   | 13.4 M/s |
+| **alosmap Typed** | **3.17**| **316 M/s** |
+| alosmap (any)     |   5.00  |  200 M/s |
+| xsync             |   7.00  |  143 M/s |
+| cmap              |  13.9   | 72 M/s   |
+| sync.Map          |  14.8   | 68 M/s   |
+| map + RWMutex     |  75.4   | 13.3 M/s |
 
-Under a 50/50 delete/store mix both alosmap maps lead the field — their delete
-just stamps a tombstone with no synchronous compaction, so it stays close to a
-plain store. `xsync` and `cmap` follow; `map + RWMutex` is ~10–15× slower.
+The Typed map now leads the delete benchmark outright — its delete is lock-free,
+just CAS-stamps a tombstone, so it pulls ahead of the any map. The any map is
+second; both still beat xsync and cmap comfortably. `map + RWMutex` is
+~10–15× slower on every contended operation.
 
 ---
 
@@ -300,16 +307,16 @@ entry's heap struct is PREFETCHT0'd before dereference.
 
 | Map               |   ns/op  | allocs |
 |-------------------|---------:|--------|
-| **alosmap Typed** | **25 µs**| 0      |
+| **alosmap Typed** | **49 µs**| 0      |
 | xsync             |    59 µs | 0      |
-| map + RWMutex     |    62 µs | 0 (but blocks all writers) |
-| alosmap (any)     |    65 µs | ~0.5 KB / 7 |
+| map + RWMutex     |    63 µs | 0 (but blocks all writers) |
+| alosmap (any)     |    65 µs | ~0.4 KB / 7 |
 | cmap              |    66 µs | 0      |
-| sync.Map          |   130 µs | 0      |
+| sync.Map          |   128 µs | 0      |
 
 `Typed`'s compact inline entries (hash + key + value word, no `valueBox` chase)
-make a plain sequential scan the fastest of all. The `any` map clusters with
-xsync/cmap; it carries a small alloc (~7, the bounded worker fan-out) but
+make a plain sequential scan the fastest of all (49 µs). The `any` map clusters
+with xsync/cmap; it carries a small alloc (~7, the bounded worker fan-out) but
 iterates **without ever blocking a writer** — `map+RWMutex` only matches it by
 RLock-freezing every writer for the whole scan.
 
@@ -317,11 +324,11 @@ RLock-freezing every writer for the whole scan.
 
 | Map           | ns/op (full Range) | allocs (driven by writer's int boxing) |
 |---------------|-------------------:|---------------------------------------|
-| **alosmap**   |     **69 700 ns**  | 11 KB / 1 358                       |
-| builtin + RW  |           64 600 ns | 0 B / 0 — writer is blocked          |
-| cmap          |           74 500 ns | 0 B / 0                             |
-| xsync         |           85 100 ns | 33 KB / 1 397                       |
-| sync.Map      |          149 200 ns | 70 KB / 2 931                       |
+| **alosmap**   |     **69 600 ns**  | 11 KB / 1 341                       |
+| builtin + RW  |           65 700 ns | 0 B / 0 — writer is blocked          |
+| cmap          |           75 000 ns | 0 B / 0                             |
+| xsync         |           93 250 ns | 41 KB / 1 712                       |
+| sync.Map      |          148 900 ns | 83 KB / 3 472                       |
 
 alosmap delivers the fastest iteration *while keeping writes flowing*.
 builtin+RW only edges it here by **blocking every concurrent writer** behind
@@ -363,9 +370,9 @@ they carry TTL or hit-limit metadata):
 
 | Operation                      |   ns/op | ops/s    | allocs       |
 |--------------------------------|--------:|---------:|--------------|
-| `StoreWithTTL` (parallel)      |   29.79 |  33.6 M/s | 56 B / 3     |
-| `StoreWithHits` (parallel)     |   24.36 |  41.1 M/s | 56 B / 3     |
-| `StoreWithTTLAndHits` (par.)   |   27.13 |  36.9 M/s | 56 B / 3     |
+| `StoreWithTTL` (parallel)      |   26.09 |  38.3 M/s | 56 B / 3     |
+| `StoreWithHits` (parallel)     |   23.66 |  42.3 M/s | 56 B / 3     |
+| `StoreWithTTLAndHits` (par.)   |   25.83 |  38.7 M/s | 56 B / 3     |
 
 These are ~4× slower than a plain `Store` because they allocate a `valueBox`
 plus a `valueMeta` record to carry the expiration / hit-counter state — but
@@ -380,11 +387,11 @@ that sync.Map doesn't even offer.
 
 | Shards |    ns/op | ops/s    |
 |-------:|---------:|---------:|
-|      1 |    2.057 |  486 M/s |
-|     16 |    1.962 |  510 M/s |
+|      1 |    2.023 |  494 M/s |
+|     16 |    2.024 |  494 M/s |
 |     64 |    2.058 |  486 M/s |
-|    256 |    2.351 |  425 M/s |
-|  1 024 |    2.581 |  387 M/s |
+|    256 |    2.387 |  419 M/s |
+|  1 024 |    2.673 |  374 M/s |
 
 Read throughput is essentially flat across shard counts; the map
 auto-selects a reasonable shard count for you.
@@ -393,13 +400,70 @@ auto-selects a reasonable shard count for you.
 
 | Entries  |    ns/op | ops/s    |
 |---------:|---------:|---------:|
-|       64 |    1.424 |  702 M/s |
-|    1 024 |    1.601 |  625 M/s |
-|   16 384 |    2.400 |  417 M/s |
-|  262 144 |    3.103 |  322 M/s |
+|       64 |    1.255 |  797 M/s |
+|    1 024 |    1.384 |  723 M/s |
+|   16 384 |    2.062 |  485 M/s |
+|  262 144 |    2.776 |  360 M/s |
 
 Reads grow ~2× from 64 to 256 K entries — pure cache-miss cost, not a
 data-structure tax.
+
+---
+
+### Fair head-to-head (realistic Zipfian / churn / footprint)
+
+A second, stricter suite in the separate `fairbenchmark/` module drives every map through one identical interface on realistic workloads — Zipfian hot-key skew, contended grow-from-empty, cache-style churn of distinct keys, and pointer values — and measures retained memory, the dimension throughput hides.
+
+ns/op unless noted, 16 goroutines. **Bold = fastest in row.**
+
+| Workload                   | alosmap | Typed    | sync.Map | map+RWMutex | xsync    | cmap   |
+|----------------------------|--------:|---------:|---------:|------------:|---------:|-------:|
+| Read Zipf int64            |    2.74 |     1.86 |     3.97 |        24.4 | **1.75** |   9.10 |
+| Read Uniform int64         |    6.29 |     4.35 |     7.91 |        24.4 | **3.12** |   8.35 |
+| Read Zipf \*ptr            |    2.60 |     1.84 |     3.96 |        24.2 | **1.75** |   9.92 |
+
+| Workload                   | alosmap | Typed    | sync.Map | map+RWMutex | xsync    | cmap   |
+|----------------------------|--------:|---------:|---------:|------------:|---------:|-------:|
+| Update Zipf int64          |    7.33 | **5.92** |     51.9 |        83.0 |     33.6 |   46.5 |
+| Update Zipf \*ptr          |    14.6 |**13.9**  |     58.9 |       121.5 |     42.2 |   53.0 |
+| Mixed 95% read             |    3.26 | **2.38** |      6.40|        72.3 |     4.31 |   44.1 |
+| Mixed 50% read             |    5.78 | **4.50** |     31.1 |       192.7 |     20.9 |   72.4 |
+| LoadOrStore int64          |    6.82 |     1.88 |     16.3 |        56.9 | **1.81** |   28.0 |
+
+Growth & churn (ns/key for InsertGrow, ns/op for Churn):
+
+| Workload                   | alosmap | Typed    | sync.Map | map+RWMutex | xsync    | cmap   |
+|----------------------------|--------:|---------:|---------:|------------:|---------:|-------:|
+| InsertGrow int64 (ns/key)  |    64.7 |**24.2**  |     36.7 |       148.4 |     35.1 |   41.9 |
+| InsertGrow \*ptr (ns/key)  |    70.8 |**40.7**  |     53.0 |       214.0 |     50.3 |   58.5 |
+| Churn int64                |     425 |    86.7  |     68.0 |         421 | **43.3** |   69.6 |
+| Churn \*ptr                |     393 |    93.6  |     85.5 |         468 | **54.4** |   91.8 |
+
+Range full iteration (µs):
+
+| Workload                   | alosmap | Typed    | sync.Map | map+RWMutex | xsync    | cmap   |
+|----------------------------|--------:|---------:|---------:|------------:|---------:|-------:|
+| Range int64                |   161.6 |**119.3** |    312.5 |       130.2 |    143.9 |  154.1 |
+| Range \*ptr                |   137.3 |**114.5** |    304.4 |       131.1 |    143.0 |  153.4 |
+
+#### Memory footprint
+
+Lower is leaner. **Bold = leanest.**
+
+Retained heap, 500 000 live entries (B/entry):
+
+| Value type         | alosmap | Typed | sync.Map | map+RWMutex  | xsync | cmap         |
+|--------------------|--------:|------:|---------:|-------------:|------:|-------------:|
+| int64 values       |   129.1 |  64.8 |    124.8 |    **55.9**  |  58.0 |      55.9    |
+| \*Session ptr values|  185.0 | 128.8 |    180.7 |    **119.9** | 122.0 |     119.9    |
+
+Cache churn, held heap after 2 000 000 distinct insert+delete ops over a 10 000-entry working set (B/live):
+
+| alosmap | Typed | sync.Map | map+RWMutex | xsync | cmap        |
+|--------:|------:|---------:|------------:|------:|------------:|
+|   156.2 |  94.8 |    177.5 |        67.9 |  94.8 |    **59.8** |
+
+Typed wins Update, Mixed, both InsertGrow variants, and Range outright; reads are a near-tie behind xsync; xsync leads pure cache-churn throughput; on memory the compact maps (cmap/RWMutex) are leanest, with Typed now mid-pack and far below the any map's churn footprint.
 
 ---
 
@@ -438,9 +502,9 @@ the struct directly:
 | Pattern                                  |       ops/s |  ns/op | allocs |
 |------------------------------------------|------------:|-------:|:-------|
 | `atomic.Int64.Add` via loaded pointer    |     608 M/s |  1.645 | 0      |
-| `atomic.Bool.Store` via loaded pointer   |     584 M/s |  1.711 | 0      |
-| `atomic.Value.Store` via loaded pointer  |     271 M/s |  3.689 | 0      |
-| `StringSet` via loaded pointer           |    33.9 M/s | 29.49  | 2      |
+| `atomic.Bool.Store` via loaded pointer   |     590 M/s |  1.695 | 0      |
+| `atomic.Value.Store` via loaded pointer  |     268 M/s |  3.734 | 0      |
+| `StringSet` via loaded pointer           |    31.1 M/s | 32.20  | 2      |
 
 ### Value and key semantics
 

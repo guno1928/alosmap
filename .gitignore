@@ -30,3 +30,7 @@
 # Benchmark suite (separate module). Its own .gitignore drops results/.
 !/benchmarks/
 !/benchmarks/**
+
+# Fair head-to-head suite (separate module).
+!/fairbenchmark/
+!/fairbenchmark/**
