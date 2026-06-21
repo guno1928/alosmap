@@ -59,6 +59,120 @@ func BenchmarkAlos_AnyVsTyped(b *testing.B) {
 	})
 }
 
+func BenchmarkAlos_SequentialLatency(b *testing.B) {
+	const val = int64(7)
+	skeys := stringKeys(benchN)
+	sm := alosmap.New(alosmap.WithCapacity(benchN), alosmap.WithoutCleanup())
+	im := alosmap.New(alosmap.WithCapacity(benchN), alosmap.WithoutCleanup())
+	for i := 0; i < benchN; i++ {
+		sm.Store(alosmap.S(skeys[i]), val)
+		im.Store(alosmap.I(int64(i)), val)
+	}
+	defer sm.Close()
+	defer im.Close()
+
+	b.Run("Load/string", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sm.Load(alosmap.S(skeys[i%benchN]))
+		}
+	})
+	b.Run("Load/int64", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			im.Load(alosmap.I(int64(i % benchN)))
+		}
+	})
+	b.Run("Store/string", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sm.Store(alosmap.S(skeys[i%benchN]), val)
+		}
+	})
+	b.Run("Store/int64", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			im.Store(alosmap.I(int64(i%benchN)), val)
+		}
+	})
+	b.Run("Peek/string", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sm.Peek(alosmap.S(skeys[i%benchN]))
+		}
+	})
+	b.Run("Peek/int64", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			im.Peek(alosmap.I(int64(i % benchN)))
+		}
+	})
+	b.Run("Has/string", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sm.Has(alosmap.S(skeys[i%benchN]))
+		}
+	})
+	b.Run("Has/int64", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			im.Has(alosmap.I(int64(i % benchN)))
+		}
+	})
+	b.Run("Swap/string", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sm.Swap(alosmap.S(skeys[i%benchN]), val)
+		}
+	})
+	b.Run("Swap/int64", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			im.Swap(alosmap.I(int64(i%benchN)), val)
+		}
+	})
+	b.Run("CompareAndSwap/string", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sm.CompareAndSwap(alosmap.S(skeys[i%benchN]), val, val)
+		}
+	})
+	b.Run("CompareAndSwap/int64", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			im.CompareAndSwap(alosmap.I(int64(i%benchN)), val, val)
+		}
+	})
+	b.Run("DeleteReStore/string", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			k := alosmap.S(skeys[i%benchN])
+			sm.Delete(k)
+			sm.Store(k, val)
+		}
+	})
+	b.Run("DeleteReStore/int64", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			k := alosmap.I(int64(i % benchN))
+			im.Delete(k)
+			im.Store(k, val)
+		}
+	})
+	b.Run("LoadOrStore/string", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sm.LoadOrStore(alosmap.S(skeys[i%benchN]), val)
+		}
+	})
+	b.Run("LoadOrStore/int64", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			im.LoadOrStore(alosmap.I(int64(i%benchN)), val)
+		}
+	})
+}
+
 func BenchmarkAlos_TTL(b *testing.B) {
 	keys := stringKeys(benchN)
 

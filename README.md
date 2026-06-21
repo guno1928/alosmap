@@ -173,7 +173,7 @@ never touch the library). Reproduce on your own hardware with:
 
 ```bash
 cd benchmarks
-go test -run='^$' -bench='BenchmarkX_' -benchmem -benchtime=200ms -count=5
+go test -run='^$' -bench=. -benchmem -benchtime=200ms -count=5
 ```
 
 ```bash
@@ -348,18 +348,18 @@ because the others don't offer a parallel-visitor Range.
 
 ### Sequential operation latency
 
-Single-goroutine performance with 10 000 pre-loaded entries:
+Single-goroutine performance with 8 192 pre-loaded entries (`any` Map):
 
 | Operation           | String keys | Int64 keys |
 |---------------------|------------:|-----------:|
-| Load                |    20.1 ns  |   16.7 ns  |
-| Store (update)      |    37.9 ns  |   36.1 ns  |
-| Peek                |    20.9 ns  |   13.8 ns  |
-| Has                 |    20.8 ns  |       —    |
-| Swap                |    37.7 ns  |       —    |
-| CompareAndSwap      |    59.2 ns  |       —    |
-| Delete + re-Store   |   142.6 ns  |  132.3 ns  |
-| LoadOrStore (hit)   |    32.4 ns  |       —    |
+| Load                |    16.1 ns  |    9.0 ns  |
+| Store (update)      |    18.3 ns  |   13.2 ns  |
+| Peek                |    15.8 ns  |    9.0 ns  |
+| Has                 |    15.8 ns  |    8.6 ns  |
+| Swap                |    18.6 ns  |   12.9 ns  |
+| CompareAndSwap      |    88.0 ns  |   80.5 ns  |
+| Delete + re-Store   |    98.1 ns  |   82.5 ns  |
+| LoadOrStore (hit)   |    17.0 ns  |    9.7 ns  |
 
 ---
 
