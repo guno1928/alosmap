@@ -333,6 +333,88 @@ func (m *TypedMap[K, V]) swapMeta(key K, val V, md *typedMeta) (V, bool) {
 	}
 }
 
+type ComputeOp int
+
+const (
+	CancelOp ComputeOp = iota
+	UpdateOp
+	DeleteOp
+)
+
+func (m *TypedMap[K, V]) Compute(key K, fn func(oldValue V, loaded bool) (newValue V, op ComputeOp)) (V, bool) {
+	var zero V
+	h := m.hash(key)
+	s := &m.shards[(h>>32)&m.shardMask]
+
+	s.mu.Lock()
+	t := s.table.Load()
+	used := int(atomic.LoadInt64(&t.count) + atomic.LoadInt64(&t.tombstones))
+	if (used+1)*4 >= len(t.slots)*3 {
+		t = m.growLocked(s, t)
+	}
+	idx := h & t.mask
+	firstTomb := -1
+	for probes := 0; probes < len(t.slots); probes++ {
+		e := t.slots[idx].Load()
+		if e == nil {
+			newValue, op := fn(zero, false)
+			if op != UpdateOp {
+				s.mu.Unlock()
+				return zero, false
+			}
+			ne := s.newEntry()
+			ne.hash = h
+			ne.key = key
+			m.storeVal(ne, newValue)
+			if firstTomb >= 0 {
+				t.slots[firstTomb].Store(ne)
+				atomic.AddInt64(&t.tombstones, -1)
+			} else {
+				t.slots[idx].Store(ne)
+			}
+			atomic.AddInt64(&t.count, 1)
+			s.mu.Unlock()
+			return newValue, true
+		}
+		if e == m.tomb {
+			if firstTomb < 0 {
+				firstTomb = int(idx)
+			}
+		} else if e.hash == h && e.key == key {
+			old := zero
+			loaded := true
+			if md := e.meta.Load(); md != nil && md.deadForView(time.Now().UnixNano()) {
+				loaded = false
+			} else {
+				old = m.loadVal(e)
+			}
+			newValue, op := fn(old, loaded)
+			switch op {
+			case UpdateOp:
+				m.storeVal(e, newValue)
+				if e.meta.Load() != nil {
+					e.meta.Store(nil)
+				}
+				s.mu.Unlock()
+				return newValue, true
+			case DeleteOp:
+				if t.slots[idx].CompareAndSwap(e, m.tomb) {
+					atomic.AddInt64(&t.count, -1)
+					atomic.AddInt64(&t.tombstones, 1)
+				}
+				s.mu.Unlock()
+				return old, false
+			default:
+				s.mu.Unlock()
+				return old, loaded
+			}
+		}
+		idx = (idx + 1) & t.mask
+	}
+	s.mu.Unlock()
+	return zero, false
+}
+
 // CompareAndSwap atomically replaces old with new for key, returning true on
 // success. It fails if the key is absent, expired, or its current value differs.
 func (m *TypedMap[K, V]) CompareAndSwap(key K, old, new V) bool {
