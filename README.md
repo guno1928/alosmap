@@ -69,7 +69,8 @@ users.Delete("u:42")
 ```
 
 `TypedMap` mirrors the full `Map` API — beyond the basics above it has `LoadOrStore`,
-`Swap`, `CompareAndSwap`/`CompareAndDelete`, `Has`/`Peek`/`Get`, TTL- and hit-limited
+`Swap`, `CompareAndSwap`/`CompareAndDelete`, `Compute` (atomic read-modify-write),
+`Has`/`Peek`/`Get`, TTL- and hit-limited
 stores (`StoreWithTTL`, `StoreWithHits`, `StoreWithTTLAndHits`, …), `Snapshot`,
 `RangePar`, `Clear`, `CleanupNow`, and `Stats`. Plain `Store`/`Load` stay zero-alloc;
 only TTL/hit entries allocate a small metadata word, so the hot path keeps the speeds
@@ -1311,6 +1312,50 @@ fmt.Println(stats.LiveEntries) // 3
 fmt.Println(m.Has(alosmap.I(3))) // false
 ```
 
+### 31. `Compute` for atomic read-modify-write: counters, conditional updates, and refcounts
+
+`Compute(key, fn)` reads the current value, runs `fn(old, loaded)`, and applies the
+returned op — `UpdateOp` writes `new`, `DeleteOp` removes the key, `CancelOp` leaves it
+untouched. The whole read-modify-write is atomic, so it is the right tool whenever the new
+value depends on the old one (a plain `Store` can lose concurrent updates). `fn` must be
+**pure / side-effect-free**: under contention it may be invoked more than once before an
+update commits.
+
+```go
+hits := alosmap.NewTyped[string, int64]()
+
+hits.Compute("/home", func(old int64, loaded bool) (int64, alosmap.ComputeOp) {
+	return old + 1, alosmap.UpdateOp // loaded is false on first touch, old is 0
+})
+hits.Compute("/home", func(old int64, loaded bool) (int64, alosmap.ComputeOp) {
+	return old + 1, alosmap.UpdateOp
+})
+n, _ := hits.Load("/home")
+fmt.Println(n) // 2
+
+version := alosmap.NewTyped[string, int64]()
+version.Store("schema", 5)
+incoming := int64(4)
+version.Compute("schema", func(old int64, loaded bool) (int64, alosmap.ComputeOp) {
+	if loaded && incoming <= old {
+		return old, alosmap.CancelOp // stale write, skip without touching the map
+	}
+	return incoming, alosmap.UpdateOp
+})
+v, _ := version.Load("schema")
+fmt.Println(v) // 5, the stale update was cancelled
+
+refs := alosmap.NewTyped[string, int64]()
+refs.Store("conn:1", 1)
+post, ok := refs.Compute("conn:1", func(old int64, loaded bool) (int64, alosmap.ComputeOp) {
+	if old <= 1 {
+		return 0, alosmap.DeleteOp // last reference released, drop the entry
+	}
+	return old - 1, alosmap.UpdateOp
+})
+fmt.Println(post, ok, refs.Has("conn:1")) // 1 false false
+```
+
 ## API Reference
 
 ### Construction
@@ -1361,6 +1406,7 @@ path keeps the typed map's speed.
 | `tm.Swap(k, v) (V, bool)` | Replace, return previous |
 | `tm.CompareAndSwap(k, old, new) bool` | Conditional replace |
 | `tm.CompareAndDelete(k, old) bool` | Conditional delete |
+| `tm.Compute(k, fn) (V, bool)` | Atomic read-modify-write; `fn(old, loaded)` returns `(new, op)` where `op` is `UpdateOp`/`DeleteOp`/`CancelOp`. `fn` must be pure — it may be invoked more than once |
 | `tm.StoreWithTTL(k, v, ttl)` | Insert with time-to-live |
 | `tm.StoreWithHits(k, v, hits)` | Insert with a read budget |
 | `tm.StoreWithTTLAndHits(k, v, ttl, hits)` | Insert with both limits |

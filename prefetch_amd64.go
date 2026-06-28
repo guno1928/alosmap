@@ -11,7 +11,3 @@ import "unsafe"
 //go:noescape
 //go:nosplit
 func prefetchT0(addr unsafe.Pointer)
-
-//go:noescape
-//go:nosplit
-func prefetchT2(addr unsafe.Pointer)
