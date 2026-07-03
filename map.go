@@ -1290,7 +1290,7 @@ func (m *Map) Clear() {
 func (m *Map) CleanupNow() {
 	now := time.Now().UnixNano()
 	for index := range m.shards {
-		m.shards[index].cleanup(now)
+		m.shards[index].cleanupGuarded(now)
 	}
 }
 
@@ -2084,6 +2084,13 @@ func (s *shard) clear() {
 	s.valueBytes.Store(0)
 	s.needsCleanup.Store(false)
 	s.resizes.Add(1)
+}
+
+func (s *shard) cleanupGuarded(now int64) {
+	defer func() {
+		_ = recover()
+	}()
+	s.cleanup(now)
 }
 
 func (s *shard) cleanup(now int64) {
