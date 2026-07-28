@@ -788,8 +788,9 @@ func (m *Map) Store(key Key, value any) {
 				current := currentTable.slots[idx].entry.Load()
 				if current != nil && current.hash == hash && keysEqual(current.key, key) {
 					if b := current.value.Load(); b != nil && b.isSimple() && b.typ == newTyp && newTyp != 0 {
-						b.data.Store((*byte)(newData))
-						return
+						if _, published := b.swapData((*byte)(newData)); published {
+							return
+						}
 					}
 					break
 				}
@@ -929,12 +930,12 @@ func (m *Map) Load(key Key) (any, bool) {
 				// Fast path: a simple box (no TTL/hits) reconstructs its value
 				// directly from the internally-consistent (typ, data) words.
 				if boxed.isSimple() {
-					return boxed.val(), true
+					return boxed.liveVal()
 				}
 				if boxed.expires() == 0 {
 					hits := boxed.hitsLoad()
 					if hits == 0 {
-						return boxed.val(), true
+						return boxed.liveVal()
 					}
 					if hits > 0 {
 						return s.readEntryConsumeHit(current, boxed)
@@ -945,7 +946,7 @@ func (m *Map) Load(key Key) (any, bool) {
 						}
 						return nil, false
 					}
-					return boxed.val(), true
+					return boxed.liveVal()
 				}
 				return s.readEntrySlow(current, true)
 			}
@@ -995,17 +996,17 @@ func (m *Map) Peek(key Key) (any, bool) {
 					return nil, false
 				}
 				if boxed.isSimple() {
-					return boxed.val(), true
+					return boxed.liveVal()
 				}
 				if boxed.expires() == 0 {
 					hits := boxed.hitsLoad()
 					if hits == 0 {
-						return boxed.val(), true
+						return boxed.liveVal()
 					}
 					if hits < 0 {
 						return nil, false
 					}
-					return boxed.val(), true
+					return boxed.liveVal()
 				}
 				return s.readEntrySlow(current, false)
 			}
@@ -1104,11 +1105,10 @@ func (m *Map) LoadOrStore(key Key, value any) (any, bool) {
 			current := currentTable.slots[idx].entry.Load()
 			if current != nil && current.hash == hash && keysEqual(current.key, key) {
 				existing := current.value.Load()
-				if existing != nil && existing.isSimple() {
-					return existing.val(), true
-				}
-				if existing != nil && existing.expires() == 0 && existing.hitsLoad() == 0 {
-					return existing.val(), true
+				if existing != nil && (existing.isSimple() || (existing.expires() == 0 && existing.hitsLoad() == 0)) {
+					if value, live := existing.liveVal(); live {
+						return value, true
+					}
 				}
 				break
 			}
@@ -1166,8 +1166,9 @@ func (m *Map) Swap(key Key, value any) (any, bool) {
 				current := currentTable.slots[idx].entry.Load()
 				if current != nil && current.hash == hash && keysEqual(current.key, key) {
 					if b := current.value.Load(); b != nil && b.isSimple() && b.typ == newTyp && newTyp != 0 {
-						oldData := b.data.Swap((*byte)(newData))
-						return ifaceFromWords(newTyp, unsafe.Pointer(oldData)), true
+						if oldData, published := b.swapData((*byte)(newData)); published {
+							return ifaceFromWords(newTyp, unsafe.Pointer(oldData)), true
+						}
 					}
 					break
 				}
@@ -1224,7 +1225,11 @@ func (m *Map) CompareAndSwap(key Key, oldValue any, newValue any) bool {
 				if existing.expires() != 0 || existing.hitsLoad() < 0 {
 					break
 				}
-				if !valuesEqual(existing.val(), oldValue) {
+				value, live := existing.liveVal()
+				if !live {
+					return false
+				}
+				if !valuesEqual(value, oldValue) {
 					return false
 				}
 				boxed := m.newValueBox(newValue, EntryOptions{})
@@ -1540,13 +1545,13 @@ func (s *shard) readEntry(current *entry, consumeHits bool) (any, bool) {
 		return nil, false
 	}
 	if boxed.isSimple() {
-		return boxed.val(), true
+		return boxed.liveVal()
 	}
 
 	if boxed.expires() == 0 {
 		hits := boxed.hitsLoad()
 		if hits == 0 {
-			return boxed.val(), true
+			return boxed.liveVal()
 		}
 		if hits > 0 && consumeHits {
 			return s.readEntryConsumeHit(current, boxed)
@@ -1557,7 +1562,7 @@ func (s *shard) readEntry(current *entry, consumeHits bool) (any, bool) {
 			}
 			return nil, false
 		}
-		return boxed.val(), true
+		return boxed.liveVal()
 	}
 
 	return s.readEntrySlow(current, consumeHits)
@@ -1577,12 +1582,12 @@ func (s *shard) readEntryConsumeHit(current *entry, boxed *valueBox) (any, bool)
 			}
 			continue
 		}
-		value := boxed.val()
+		value, live := boxed.liveVal()
 		if exhausted {
 			s.clearIfMatch(current, boxed, false, true)
 			s.maybeResize()
 		}
-		return value, true
+		return value, live
 	}
 }
 
@@ -1594,7 +1599,7 @@ func (s *shard) readEntrySlow(current *entry, consumeHits bool) (any, bool) {
 		}
 
 		if boxed.isSimple() {
-			return boxed.val(), true
+			return boxed.liveVal()
 		}
 
 		if boxed.expires() > 0 && time.Now().UnixNano() >= boxed.expires() {
@@ -1613,7 +1618,7 @@ func (s *shard) readEntrySlow(current *entry, consumeHits bool) (any, bool) {
 				}
 				continue
 			}
-			return boxed.val(), true
+			return boxed.liveVal()
 		}
 
 		consumed, exhausted := boxed.consumeHit()
@@ -1625,12 +1630,12 @@ func (s *shard) readEntrySlow(current *entry, consumeHits bool) (any, bool) {
 			continue
 		}
 
-		value := boxed.val()
+		value, live := boxed.liveVal()
 		if exhausted {
 			s.clearIfMatch(current, boxed, false, true)
 			s.maybeResize()
 		}
-		return value, true
+		return value, live
 	}
 }
 
@@ -1691,7 +1696,9 @@ func (s *shard) loadOrStoreDeferred(hash uint64, key Key, value any, options Ent
 			if current != nil && current.hash == hash && keysEqual(current.key, key) {
 				existing := current.value.Load()
 				if existing != nil && existing.expires() == 0 && existing.hitsLoad() == 0 {
-					return existing.val(), true
+					if value, live := existing.liveVal(); live {
+						return value, true
+					}
 				}
 				break
 			}
@@ -1780,8 +1787,13 @@ outer:
 						}
 						continue
 					}
+					value, live := existing.liveVal()
+					if !live {
+						revive = true
+						break
+					}
 					s.endWrite()
-					return existing.val(), true
+					return value, true
 				}
 				if revive {
 					var cloned any
@@ -1904,7 +1916,33 @@ func (s *shard) delete(hash uint64, key Key) (any, bool) {
 				continue
 			}
 
-			deletedValue := boxed.val()
+			if boxed.isSimple() {
+				deletedValue, claimed := boxed.claim()
+				if !claimed {
+					s.endWrite()
+					return nil, false
+				}
+				if current.value.CompareAndSwap(boxed, nil) {
+					s.live.Add(-1)
+					s.tombstones.Add(1)
+					s.keyBytes.Add(-keySize(current.key))
+					if !s.needsCleanup.Load() {
+						s.needsCleanup.Store(true)
+					}
+				}
+				resizeNeeded := s.shouldResizeWithTable(currentTable)
+				s.endWrite()
+				if resizeNeeded {
+					s.resize(int(s.live.Load()))
+				}
+				return deletedValue, true
+			}
+
+			deletedValue, live := boxed.liveVal()
+			if !live {
+				s.endWrite()
+				return nil, false
+			}
 			if current.value.CompareAndSwap(boxed, nil) {
 				s.live.Add(-1)
 				s.tombstones.Add(1)
@@ -1967,9 +2005,26 @@ func (s *shard) compareAndSwap(hash uint64, key Key, oldValue any, boxed *valueB
 				continue
 			}
 
-			if !valuesEqual(existing.val(), oldValue) {
+			data, value, live := existing.liveData()
+			if !live {
 				s.endWrite()
 				return false
+			}
+			if !valuesEqual(value, oldValue) {
+				s.endWrite()
+				return false
+			}
+
+			if existing.sameShape(boxed) {
+				if !existing.replaceData(data, boxed) {
+					continue
+				}
+				resizeNeeded := s.shouldResizeWithTable(currentTable)
+				s.endWrite()
+				if resizeNeeded {
+					s.resize(int(s.live.Load()))
+				}
+				return true
 			}
 
 			if current.value.CompareAndSwap(existing, boxed) {
@@ -2029,9 +2084,32 @@ func (s *shard) compareAndDelete(hash uint64, key Key, oldValue any) bool {
 				continue
 			}
 
-			if !valuesEqual(existing.val(), oldValue) {
+			data, value, live := existing.liveData()
+			if !live {
 				s.endWrite()
 				return false
+			}
+			if !valuesEqual(value, oldValue) {
+				s.endWrite()
+				return false
+			}
+
+			if existing.isSimple() {
+				if !existing.claimData(data) {
+					continue
+				}
+				if current.value.CompareAndSwap(existing, nil) {
+					s.live.Add(-1)
+					s.tombstones.Add(1)
+					s.keyBytes.Add(-keySize(current.key))
+					s.needsCleanup.Store(true)
+				}
+				resizeNeeded := s.shouldResizeWithTable(currentTable)
+				s.endWrite()
+				if resizeNeeded {
+					s.resize(int(s.live.Load()))
+				}
+				return true
 			}
 
 			if current.value.CompareAndSwap(existing, nil) {
@@ -2244,12 +2322,16 @@ func (s *shard) replaceOrRevive(current *entry, boxed *valueBox) (any, bool) {
 			continue
 		}
 
+		previous, live := existing.liveVal()
 		if current.value.CompareAndSwap(existing, boxed) {
 			s.valueBytes.Add(boxed.cloned() - existing.cloned())
 			if boxed.requiresCleanup() {
 				s.needsCleanup.Store(true)
 			}
-			return existing.val(), true
+			if !live {
+				return nil, false
+			}
+			return previous, true
 		}
 	}
 }
@@ -2266,7 +2348,8 @@ func (s *shard) loadOrStoreCurrent(current *entry, boxed *valueBox) (any, bool) 
 				if boxed.requiresCleanup() {
 					s.needsCleanup.Store(true)
 				}
-				return boxed.val(), false
+				stored, _ := boxed.liveVal()
+				return stored, false
 			}
 			continue
 		}
@@ -2285,7 +2368,20 @@ func (s *shard) loadOrStoreCurrent(current *entry, boxed *valueBox) (any, bool) 
 			continue
 		}
 
-		return existing.val(), true
+		value, live := existing.liveVal()
+		if !live {
+			if current.value.CompareAndSwap(existing, boxed) {
+				s.valueBytes.Add(boxed.cloned() - existing.cloned())
+				if boxed.requiresCleanup() {
+					s.needsCleanup.Store(true)
+				}
+				stored, _ := boxed.liveVal()
+				return stored, false
+			}
+			continue
+		}
+
+		return value, true
 	}
 }
 

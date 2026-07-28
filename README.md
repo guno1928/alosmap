@@ -212,9 +212,9 @@ Honest reading of the numbers:
   (1.74 ns), `any` third (2.01 ns) — all lock-free, all far ahead of `sync.Map`,
   cmap, and RWMutex.
 - **Delete: Typed now leads the field** under a 50/50 delete/store mix: `Typed`
-  (3.17 ns) is now fastest outright — its delete is lock-free, just CAS-stamps a
-  tombstone — with `any` (5.00 ns) second. Both still beat xsync (7.00 ns) and
-  cmap (13.9 ns). RWMutex is ~10–15× behind.
+  (3.17 ns) is now fastest outright — it stamps a tombstone under a short
+  per-shard lock — with `any` (5.00 ns) second. Both still beat xsync (7.00 ns)
+  and cmap (13.9 ns). RWMutex is ~10–15× behind.
 - **`map + sync.RWMutex`** — the "just lock it" default — is **10–30× slower**
   than the lock-free maps under contention. The numbers are why this library
   exists.
@@ -290,9 +290,9 @@ word with **zero allocations** — ~3.7× faster than xsync and ~9.2× faster th
 | sync.Map          |  14.8   | 68 M/s   |
 | map + RWMutex     |  75.4   | 13.3 M/s |
 
-The Typed map now leads the delete benchmark outright — its delete is lock-free,
-just CAS-stamps a tombstone, so it pulls ahead of the any map. The any map is
-second; both still beat xsync and cmap comfortably. `map + RWMutex` is
+The Typed map now leads the delete benchmark outright — it just stamps a
+tombstone under a short per-shard lock, so it pulls ahead of the any map. The any
+map is second; both still beat xsync and cmap comfortably. `map + RWMutex` is
 ~10–15× slower on every contended operation.
 
 ---

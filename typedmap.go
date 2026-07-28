@@ -35,14 +35,13 @@ type TypedMap[K comparable, V any] struct {
 }
 
 type typedShard[K comparable] struct {
-	table     atomic.Pointer[typedTable[K]]
-	resizeGen atomic.Int64
-	_         [32]byte
-	mu        sync.Mutex
-	chunk     []typedEntry[K]
-	off       int
-	depth     int
-	_         [16]byte
+	table atomic.Pointer[typedTable[K]]
+	_     [40]byte
+	mu    sync.Mutex
+	chunk []typedEntry[K]
+	off   int
+	depth int
+	_     [16]byte
 }
 
 type typedTable[K comparable] struct {
@@ -358,14 +357,6 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
 
-	if e := m.find(s.table.Load(), h, key); e != nil {
-		m.storeVal(e, val)
-		if m.hasMeta.Load() && e.meta.Load() != nil {
-			e.meta.Store(nil)
-		}
-		return
-	}
-
 	s.mu.Lock()
 	t := s.table.Load()
 	used := int(t.count.Load() + t.tombstones.Load())
@@ -414,27 +405,6 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 	}
 }
 
-func (m *TypedMap[K, V]) repairDelete(s *typedShard[K], h uint64, key K) {
-	s.mu.Lock()
-	t := s.table.Load()
-	idx := h & t.mask
-	for {
-		e := t.slots[idx].Load()
-		if e == nil {
-			s.mu.Unlock()
-			return
-		}
-		if e != m.tomb && e.hash == h && e.key == key {
-			t.slots[idx].Store(m.tomb)
-			t.count.Add(-1)
-			t.tombstones.Add(1)
-			s.mu.Unlock()
-			return
-		}
-		idx = (idx + 1) & t.mask
-	}
-}
-
 // Delete removes key and returns the previous value with true, or the zero V and
 // false if the key was absent.
 //
@@ -448,36 +418,6 @@ func (m *TypedMap[K, V]) repairDelete(s *typedShard[K], h uint64, key K) {
 func (m *TypedMap[K, V]) Delete(key K) (V, bool) {
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
-
-	if !m.hasMeta.Load() {
-		gen := s.resizeGen.Load()
-		t := s.table.Load()
-		if gen&1 == 0 {
-			idx := h & t.mask
-			for i := 0; i < 8; i++ {
-				e := t.slots[idx].Load()
-				if e == nil {
-					var zero V
-					return zero, false
-				}
-				if e != m.tomb && e.hash == h && e.key == key {
-					if e.meta.Load() == nil {
-						v := m.loadVal(e)
-						if t.slots[idx].CompareAndSwap(e, m.tomb) {
-							t.count.Add(-1)
-							t.tombstones.Add(1)
-							if s.table.Load() != t || s.resizeGen.Load() != gen {
-								m.repairDelete(s, h, key)
-							}
-							return v, true
-						}
-					}
-					break
-				}
-				idx = (idx + 1) & t.mask
-			}
-		}
-	}
 
 	s.mu.Lock()
 	t := s.table.Load()
@@ -589,7 +529,6 @@ func targetTypedSlots(curSlots, live, tombstones int) int {
 }
 
 func (m *TypedMap[K, V]) growLocked(s *typedShard[K], old *typedTable[K]) *typedTable[K] {
-	s.resizeGen.Add(1)
 	size := targetTypedSlots(len(old.slots), int(old.count.Load()), int(old.tombstones.Load()))
 	nt := &typedTable[K]{
 		slots: make([]atomic.Pointer[typedEntry[K]], size),
@@ -610,6 +549,5 @@ func (m *TypedMap[K, V]) growLocked(s *typedShard[K], old *typedTable[K]) *typed
 	}
 	nt.count.Store(cnt)
 	s.table.Store(nt)
-	s.resizeGen.Add(1)
 	return nt
 }

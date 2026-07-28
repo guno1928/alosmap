@@ -127,12 +127,6 @@ func (m *TypedMap[K, V]) putMeta(key K, val V, md *typedMeta) {
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
 
-	if e := m.find(s.table.Load(), h, key); e != nil {
-		m.storeVal(e, val)
-		e.meta.Store(md)
-		return
-	}
-
 	s.mu.Lock()
 	t := s.table.Load()
 	used := int(t.count.Load() + t.tombstones.Load())
@@ -341,32 +335,10 @@ const (
 	DeleteOp
 )
 
-const computeFastAttempts = 2
-
 func (m *TypedMap[K, V]) Compute(key K, fn func(oldValue V, loaded bool) (newValue V, op ComputeOp)) (V, bool) {
 	var zero V
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
-
-	if !m.valPtr && !m.hasMeta.Load() {
-		if e := m.find(s.table.Load(), h, key); e != nil {
-			for attempt := 0; attempt < computeFastAttempts; attempt++ {
-				ob := e.bits.Load()
-				old := fromBits[V](ob)
-				newValue, op := fn(old, true)
-				if op == UpdateOp {
-					if e.bits.CompareAndSwap(ob, toBits(newValue)) {
-						return newValue, true
-					}
-					continue
-				}
-				if op == CancelOp {
-					return old, true
-				}
-				break
-			}
-		}
-	}
 
 	s.mu.Lock()
 	t := s.table.Load()
@@ -639,8 +611,7 @@ func (m *TypedMap[K, V]) CleanupNow() {
 			s.mu.Unlock()
 			continue
 		}
-		s.resizeGen.Add(1)
-		size := targetTypedSlots(len(old.slots), int(old.count.Load()), int(old.tombstones.Load()))
+			size := targetTypedSlots(len(old.slots), int(old.count.Load()), int(old.tombstones.Load()))
 		nt := &typedTable[K]{
 			slots: make([]atomic.Pointer[typedEntry[K]], size),
 			mask:  uint64(size - 1),
@@ -663,8 +634,7 @@ func (m *TypedMap[K, V]) CleanupNow() {
 		}
 		nt.count.Store(cnt)
 		s.table.Store(nt)
-		s.resizeGen.Add(1)
-		s.mu.Unlock()
+			s.mu.Unlock()
 	}
 }
 
