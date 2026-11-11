@@ -2,7 +2,9 @@ package alosmap
 
 import (
 	"hash/maphash"
+	"math"
 	"reflect"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,8 +15,8 @@ import (
 //
 // Unlike the any-valued Map, values are not boxed into an interface: V is held in
 // an atomic machine word inside each entry, so Store performs no per-value heap
-// allocation and Load returns V directly. Reads are lock-free; writes take a
-// short per-shard lock. V must be no wider than 8 bytes (int, int64, float64, any
+// allocation and Load returns V directly. Reads and updates of existing keys are
+// lock-free; inserts and deletes take a short per-shard lock. V must be no wider than 8 bytes (int, int64, float64, any
 // pointer, or a struct that fits in a word); for larger values use a pointer type
 // such as *MyStruct.
 type TypedMap[K comparable, V any] struct {
@@ -35,13 +37,15 @@ type TypedMap[K comparable, V any] struct {
 }
 
 type typedShard[K comparable] struct {
-	table atomic.Pointer[typedTable[K]]
-	_     [40]byte
-	mu    sync.Mutex
-	chunk []typedEntry[K]
-	off   int
-	depth int
-	_     [16]byte
+	table      atomic.Pointer[typedTable[K]]
+	_          [40]byte
+	mu         sync.Mutex
+	chunk      []typedEntry[K]
+	off        int
+	depth      int
+	firstChunk int
+	chunked    int
+	_          [16]byte
 }
 
 type typedTable[K comparable] struct {
@@ -53,11 +57,49 @@ type typedTable[K comparable] struct {
 }
 
 type typedEntry[K comparable] struct {
-	hash uint64
-	key  K
-	bits atomic.Uint64
-	ptr  atomic.Pointer[byte]
-	meta atomic.Pointer[typedMeta]
+	hash  uint32
+	state atomic.Int32
+	key   K
+	bits  atomic.Uint64
+	ptr   atomic.Pointer[byte]
+	meta  atomic.Pointer[typedMeta]
+}
+
+const (
+	entryExclusive int32 = 1
+	entryWriter    int32 = 2
+)
+
+func (m *TypedMap[K, V]) homeSlot(e *typedEntry[K], mask uint64) uint64 {
+	if mask > math.MaxUint32 {
+		return m.hash(e.key) & mask
+	}
+	return uint64(e.hash) & mask
+}
+
+func (e *typedEntry[K]) enterFast() bool {
+	if e.state.Add(entryWriter)&entryExclusive != 0 {
+		e.state.Add(-entryWriter)
+		return false
+	}
+	return true
+}
+
+func (e *typedEntry[K]) exitFast() {
+	e.state.Add(-entryWriter)
+}
+
+func (e *typedEntry[K]) lockValue() {
+	e.state.Or(entryExclusive)
+	for spins := 1; e.state.Load() != entryExclusive; spins++ {
+		if spins%resizeSpinYieldInterval == 0 {
+			runtime.Gosched()
+		}
+	}
+}
+
+func (e *typedEntry[K]) unlockValue() {
+	e.state.And(^entryExclusive)
 }
 
 const (
@@ -133,6 +175,21 @@ func (m *TypedMap[K, V]) loadVal(e *typedEntry[K]) V {
 		return *(*V)(unsafe.Pointer(&p))
 	}
 	return fromBits[V](e.bits.Load())
+}
+
+func (m *TypedMap[K, V]) swapVal(e *typedEntry[K], val V) V {
+	if m.valPtr {
+		p := e.ptr.Swap(*(**byte)(unsafe.Pointer(&val)))
+		return *(*V)(unsafe.Pointer(&p))
+	}
+	return fromBits[V](e.bits.Swap(toBits(val)))
+}
+
+func (m *TypedMap[K, V]) casVal(e *typedEntry[K], old, new V) bool {
+	if m.valPtr {
+		return e.ptr.CompareAndSwap(*(**byte)(unsafe.Pointer(&old)), *(**byte)(unsafe.Pointer(&new)))
+	}
+	return e.bits.CompareAndSwap(toBits(old), toBits(new))
 }
 
 func (m *TypedMap[K, V]) valEqual(e *typedEntry[K], val V) bool {
@@ -247,8 +304,9 @@ func (m *TypedMap[K, V]) cleanupLoop() {
 }
 
 // Prealloc enables chunked allocation of entry nodes and returns the map for
-// chaining. Each shard allocates chunk entries at once and hands them out as keys
-// are inserted, allocating the next chunk only when the current one is exhausted.
+// chaining. Each shard allocates entries in batches and hands them out as keys
+// are inserted. A shard's first batch covers its share of the initial capacity,
+// and later batches grow with the shard up to chunk entries.
 // Call it once after construction, before concurrent use.
 //
 // Example, batch 256 entries at a time:
@@ -265,7 +323,9 @@ func (m *TypedMap[K, V]) Prealloc(chunk int) *TypedMap[K, V] {
 		chunk = 1
 	}
 	for i := range m.shards {
-		m.shards[i].depth = chunk
+		s := &m.shards[i]
+		s.depth = chunk
+		s.firstChunk = max(minSlabNodes, len(s.table.Load().slots)/2)
 	}
 	return m
 }
@@ -275,7 +335,12 @@ func (s *typedShard[K]) newEntry() *typedEntry[K] {
 		return &typedEntry[K]{}
 	}
 	if s.off >= len(s.chunk) {
-		s.chunk = make([]typedEntry[K], s.depth)
+		size := min(s.depth, s.firstChunk)
+		if s.chunked > 0 {
+			size = min(s.depth, max(minSlabNodes, s.chunked/2))
+		}
+		s.chunk = make([]typedEntry[K], size)
+		s.chunked += size
 		s.off = 0
 	}
 	e := &s.chunk[s.off]
@@ -301,7 +366,7 @@ func (m *TypedMap[K, V]) find(t *typedTable[K], h uint64, key K) *typedEntry[K] 
 		if e == nil {
 			return nil
 		}
-		if e != m.tomb && e.hash == h && e.key == key {
+		if e != m.tomb && e.hash == uint32(h) && e.key == key {
 			return e
 		}
 		idx = (idx + 1) & t.mask
@@ -356,6 +421,9 @@ func (m *TypedMap[K, V]) Load(key K) (V, bool) {
 func (m *TypedMap[K, V]) Store(key K, val V) {
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
+	if e := m.find(s.table.Load(), h, key); e != nil && m.tryFastStore(e, val) {
+		return
+	}
 
 	s.mu.Lock()
 	t := s.table.Load()
@@ -369,7 +437,7 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 		e := t.slots[idx].Load()
 		if e == nil {
 			ne := s.newEntry()
-			ne.hash = h
+			ne.hash = uint32(h)
 			ne.key = key
 			m.storeVal(ne, val)
 			if firstTomb >= 0 {
@@ -393,16 +461,31 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 			if firstTomb < 0 {
 				firstTomb = int(idx)
 			}
-		} else if e.hash == h && e.key == key {
+		} else if e.hash == uint32(h) && e.key == key {
+			e.lockValue()
 			m.storeVal(e, val)
 			if e.meta.Load() != nil {
 				e.meta.Store(nil)
 			}
+			e.unlockValue()
 			s.mu.Unlock()
 			return
 		}
 		idx = (idx + 1) & t.mask
 	}
+}
+
+func (m *TypedMap[K, V]) tryFastStore(e *typedEntry[K], val V) bool {
+	if !e.enterFast() {
+		return false
+	}
+	if e.meta.Load() != nil {
+		e.exitFast()
+		return false
+	}
+	m.storeVal(e, val)
+	e.exitFast()
+	return true
 }
 
 // Delete removes key and returns the previous value with true, or the zero V and
@@ -418,6 +501,10 @@ func (m *TypedMap[K, V]) Store(key K, val V) {
 func (m *TypedMap[K, V]) Delete(key K) (V, bool) {
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
+	if m.find(s.table.Load(), h, key) == nil {
+		var zero V
+		return zero, false
+	}
 
 	s.mu.Lock()
 	t := s.table.Load()
@@ -429,7 +516,8 @@ func (m *TypedMap[K, V]) Delete(key K) (V, bool) {
 			var zero V
 			return zero, false
 		}
-		if e != m.tomb && e.hash == h && e.key == key {
+		if e != m.tomb && e.hash == uint32(h) && e.key == key {
+			e.lockValue()
 			v := m.loadVal(e)
 			dead := false
 			if md := e.meta.Load(); md != nil && md.deadForView(time.Now().UnixNano()) {
@@ -496,11 +584,14 @@ func (m *TypedMap[K, V]) Range(visitor func(key K, value V) bool) {
 
 // Len returns the number of live entries currently in the map.
 func (m *TypedMap[K, V]) Len() int {
-	hasMeta := m.hasMeta.Load()
-	var now int64
-	if hasMeta {
-		now = time.Now().UnixNano()
+	if !m.hasMeta.Load() {
+		var total int64
+		for si := range m.shards {
+			total += m.shards[si].table.Load().count.Load()
+		}
+		return int(total)
 	}
+	now := time.Now().UnixNano()
 	n := 0
 	for si := range m.shards {
 		t := m.shards[si].table.Load()
@@ -509,10 +600,8 @@ func (m *TypedMap[K, V]) Len() int {
 			if e == nil || e == m.tomb {
 				continue
 			}
-			if hasMeta {
-				if md := e.meta.Load(); md != nil && md.deadForView(now) {
-					continue
-				}
+			if md := e.meta.Load(); md != nil && md.deadForView(now) {
+				continue
 			}
 			n++
 		}
@@ -540,7 +629,7 @@ func (m *TypedMap[K, V]) growLocked(s *typedShard[K], old *typedTable[K]) *typed
 		if e == nil || e == m.tomb {
 			continue
 		}
-		idx := e.hash & nt.mask
+		idx := m.homeSlot(e, nt.mask)
 		for nt.slots[idx].Load() != nil {
 			idx = (idx + 1) & nt.mask
 		}

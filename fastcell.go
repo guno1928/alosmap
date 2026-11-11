@@ -31,6 +31,20 @@ func ifaceFromWords(typ uintptr, data unsafe.Pointer) any {
 // present it as its own data word.
 var deadMarker byte
 
+var (
+	movingMarker  byte
+	nilDataMarker byte
+)
+
+type moveOutcome uint8
+
+const (
+	moveClaimed moveOutcome = iota
+	moveRemoved
+	moveBusy
+	moveChanged
+)
+
 // liveVal reconstructs the stored value from the box's interface words, and
 // reports false once a remover has claimed the box. typ is fixed for a box's
 // lifetime while data is updated atomically by same-type repeat stores, so
@@ -49,7 +63,46 @@ func (b *valueBox) liveData() (*byte, any, bool) {
 	if data == &deadMarker {
 		return nil, nil, false
 	}
+	if data == &movingMarker {
+		data = b.parkedData()
+	}
 	return data, ifaceFromWords(b.typ, unsafe.Pointer(data)), true
+}
+
+func (b *valueBox) parkedData() *byte {
+	if p := b.parked.Load(); p != &nilDataMarker {
+		return p
+	}
+	return nil
+}
+
+func (b *valueBox) moving() bool {
+	return b.data.Load() == &movingMarker
+}
+
+func (b *valueBox) claimForMove(expect *byte, conditional bool) (*byte, moveOutcome) {
+	for {
+		data := b.data.Load()
+		switch {
+		case data == &deadMarker:
+			return nil, moveRemoved
+		case data == &movingMarker:
+			return nil, moveBusy
+		case conditional && data != expect:
+			return nil, moveChanged
+		}
+		park := data
+		if park == nil {
+			park = &nilDataMarker
+		}
+		if !b.parked.CompareAndSwap(nil, park) {
+			return nil, moveBusy
+		}
+		if b.data.CompareAndSwap(data, &movingMarker) {
+			return data, moveClaimed
+		}
+		b.parked.Store(nil)
+	}
 }
 
 func (b *valueBox) claimData(data *byte) bool {
@@ -68,7 +121,7 @@ func (b *valueBox) sameShape(other *valueBox) bool {
 }
 
 // swapData publishes newData into the box and returns the data word it replaced.
-// It reports false once a remover has claimed the box, in which case nothing was
+// It reports false once a remover or mover has claimed the box, in which case nothing was
 // published and the caller must not treat its write as visible. The box's data
 // word is the single linearization point for both in-place updates and removal,
 // which is what keeps a repeat store from being swallowed by a concurrent
@@ -76,7 +129,7 @@ func (b *valueBox) sameShape(other *valueBox) bool {
 func (b *valueBox) swapData(newData *byte) (*byte, bool) {
 	for {
 		data := b.data.Load()
-		if data == &deadMarker {
+		if data == &deadMarker || data == &movingMarker {
 			return nil, false
 		}
 		if b.data.CompareAndSwap(data, newData) {

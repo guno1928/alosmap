@@ -19,6 +19,8 @@ const (
 	defaultLoadFactor             = 0.72
 	defaultShardMultiplier        = 4
 	defaultShardCount             = 32
+	defaultShardsPerProc          = 4
+	minSlabNodes                  = 16
 	defaultCleanupInterval        = 5 * time.Second
 	largeScaleCapacity            = 1_000_000
 	veryLargeScaleCapacity        = 10_000_000
@@ -204,8 +206,9 @@ type config struct {
 // than 1 are normalized to the default. Capacity influences initial allocation and
 // resize behavior only; it is not a hard maximum.
 //
-// Shards is optional. Default: 32. Constraint: positive values are rounded up to the
-// next power of two; zero or negative values use the default.
+// Shards is optional. Default: 4 per GOMAXPROCS rounded up to a power of two, at least
+// 32 and at most 1024. Constraint: positive values are rounded up to the next power of
+// two; zero or negative values use the default.
 //
 // LoadFactor is optional. Default: 0.72. Constraint: values below 0.50 are clamped
 // to 0.50 and values above 0.90 are clamped to 0.90.
@@ -326,15 +329,28 @@ type shard struct {
 	cleanupSkips   atomic.Int64
 	expiredDeletes atomic.Int64
 	hitDeletes     atomic.Int64
+	resizeDone     atomic.Pointer[chan struct{}]
 	_coldPad       [16]byte
 
 	slab      atomic.Pointer[bundleSlab]
 	slabDepth int
+	firstSlab int
 }
 
 type bundleSlab struct {
-	buf []entryBundle
-	off atomic.Int64
+	buf   []entryBundle
+	off   atomic.Int64
+	total int
+}
+
+func (s *shard) nextSlab(prev *bundleSlab) *bundleSlab {
+	size := min(s.slabDepth, s.firstSlab)
+	total := 0
+	if prev != nil {
+		total = prev.total
+		size = min(s.slabDepth, max(minSlabNodes, total/2))
+	}
+	return &bundleSlab{buf: make([]entryBundle, size), total: total + size}
 }
 
 func (s *shard) newBundle() *entryBundle {
@@ -348,7 +364,7 @@ func (s *shard) newBundle() *entryBundle {
 				return &sl.buf[i]
 			}
 		}
-		fresh := &bundleSlab{buf: make([]entryBundle, s.slabDepth)}
+		fresh := s.nextSlab(sl)
 		fresh.off.Store(1)
 		if s.slab.CompareAndSwap(sl, fresh) {
 			return &fresh.buf[0]
@@ -385,7 +401,8 @@ type valueBox struct {
 	// meta is nil for the common case (no TTL, hit limit, or clone tracking),
 	// keeping a simple box at 3 words. It is allocated only for entries that
 	// carry that metadata.
-	meta *valueMeta
+	meta   *valueMeta
+	parked atomic.Pointer[byte]
 }
 
 type valueMeta struct {
@@ -422,6 +439,70 @@ func (b *valueBox) cloned() int64 {
 type entryBundle struct {
 	ent entry
 	box valueBox
+	kb  [16]byte
+}
+
+type intBundle struct {
+	ent entry
+	box valueBox
+}
+
+const (
+	midKeyBytes  = 32
+	wideKeyBytes = 48
+)
+
+type midBundle struct {
+	ent entry
+	box valueBox
+	kb  [midKeyBytes]byte
+}
+
+type wideBundle struct {
+	ent entry
+	box valueBox
+	kb  [wideKeyBytes]byte
+}
+
+func copyKeyInto(buf []byte, s string) string {
+	n := copy(buf, s)
+	if n == 0 {
+		return ""
+	}
+	return unsafe.String(&buf[0], n)
+}
+
+func (s *shard) allocBundle(key Key) (*entry, *valueBox) {
+	if key.isInt {
+		if s.slabDepth <= 0 {
+			b := &intBundle{}
+			b.ent.key = key
+			return &b.ent, &b.box
+		}
+		b := s.newBundle()
+		b.ent.key = key
+		return &b.ent, &b.box
+	}
+	n := len(key.s)
+	if n > len(entryBundle{}.kb) && s.slabDepth <= 0 {
+		if n <= midKeyBytes {
+			b := &midBundle{}
+			b.ent.key = Key{s: copyKeyInto(b.kb[:], key.s)}
+			return &b.ent, &b.box
+		}
+		if n <= wideKeyBytes {
+			b := &wideBundle{}
+			b.ent.key = Key{s: copyKeyInto(b.kb[:], key.s)}
+			return &b.ent, &b.box
+		}
+	}
+	b := s.newBundle()
+	if n <= len(b.kb) {
+		b.ent.key = Key{s: copyKeyInto(b.kb[:], key.s)}
+	} else {
+		b.ent.key = Key{s: strings.Clone(key.s)}
+	}
+	return &b.ent, &b.box
 }
 
 // NewBuilder returns a Builder initialized with the package defaults.
@@ -485,12 +566,13 @@ func (b *Builder) ValueCloner(cloner ValueCloneFunc) *Builder {
 }
 
 // Prealloc enables chunked allocation of entry nodes and returns the Builder for
-// chaining. Each shard allocates chunk entry nodes at once instead of one per
+// chaining. Each shard allocates entry nodes in batches instead of one per
 // insert, which lowers allocation overhead on insert-heavy maps.
 //
-// The default is 0 (disabled). A positive value sets the batch size: larger
-// batches allocate less often but reserve more memory up front, and the memory of
-// a batch is not released until every node in it is gone.
+// The default is 0 (disabled). A positive value sets the largest batch size. A
+// shard's first batch covers its share of Capacity, and later batches grow with
+// the shard up to chunk nodes. Larger batches allocate less often, and the memory
+// of a batch is not released until every node in it is gone.
 //
 // Example, batch 256 nodes:
 //
@@ -522,8 +604,10 @@ func (b *Builder) Build() *Map {
 
 // WithPrealloc returns an Option that enables chunked allocation of entry nodes.
 //
-// Each shard allocates chunk entry nodes at once and hands them out as keys are
-// inserted. The default is 0 (disabled); positive values set the batch size.
+// Each shard allocates entry nodes in batches and hands them out as keys are
+// inserted. A shard's first batch covers its share of the capacity, and later
+// batches grow with the shard up to chunk nodes. The default is 0 (disabled);
+// positive values set the largest batch size.
 //
 // Example, batch 256 nodes:
 //
@@ -552,7 +636,8 @@ func WithCapacity(capacity int) Option {
 // WithShardCount returns an Option that sets the requested shard count.
 //
 // The option is optional. Positive values are rounded up to the next power of two.
-// Zero and negative values cause New to use the default of 32.
+// Zero and negative values cause New to use the default of 4 shards per GOMAXPROCS,
+// rounded up to a power of two, with a minimum of 32 and a maximum of 1024.
 func WithShardCount(count int) Option {
 	return func(cfg *config) {
 		cfg.shardCount = count
@@ -604,13 +689,13 @@ func WithValueCloner(cloner ValueCloneFunc) Option {
 // All options are optional. When omitted, New uses these defaults:
 //
 //	Capacity: 1024 expected live entries.
-//	Shard count: 32.
+//	Shard count: 4 per GOMAXPROCS, rounded up to a power of two (32 to 1024).
 //	Load factor: 0.72.
 //	Cleanup interval: 5 seconds.
 //	Value cloner: pass-through storage with zero tracked value bytes.
 //
 // Option values are normalized before construction. Capacity values below 1 fall
-// back to the default, shard counts are rounded to a power of two or default to 32,
+// back to the default, shard counts are rounded to a power of two or default to 4 per GOMAXPROCS (32 to 1024),
 // load factor is clamped to [0.50, 0.90], and negative cleanup intervals are treated
 // as 0.
 func New(options ...Option) *Map {
@@ -641,6 +726,7 @@ func New(options ...Option) *Map {
 		currentShard := &instance.shards[index]
 		currentShard.loadFactor = cfg.loadFactor
 		currentShard.slabDepth = cfg.prealloc
+		currentShard.firstSlab = max(minSlabNodes, perShardEntries)
 		initial := newTableForEntries(perShardEntries, cfg.loadFactor)
 		currentShard.initialSlots = minTableSlots
 		currentShard.table.Store(initial)
@@ -675,7 +761,7 @@ func (cfg *config) normalize() {
 		cfg.loadFactor = 0.90
 	}
 	if cfg.shardCount <= 0 {
-		cfg.shardCount = defaultShardCount
+		cfg.shardCount = defaultShards()
 	} else {
 		cfg.shardCount = nextPowerOfTwo(cfg.shardCount)
 	}
@@ -690,6 +776,10 @@ func (cfg *config) normalize() {
 	} else if reflect.ValueOf(cfg.cloneValue).Pointer() != reflect.ValueOf(defaultCloneValue).Pointer() {
 		cfg.hasCustomCloner = true
 	}
+}
+
+func defaultShards() int {
+	return min(maxAutoShards, max(defaultShardCount, nextPowerOfTwo(runtime.GOMAXPROCS(0)*defaultShardsPerProc)))
 }
 
 func autoShardCount(capacity int) int {
@@ -781,12 +871,13 @@ func (m *Map) Store(key Key, value any) {
 		mask := int(currentTable.mask)
 		for probes := 0; probes <= mask; probes++ {
 			c := ctrlLoad(ctrl, idx)
-			if c == 0 {
-				break
-			}
-			if c == fp {
+			if c == fp || c == 0 {
 				current := currentTable.slots[idx].entry.Load()
-				if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				if current == nil {
+					if c == 0 {
+						break
+					}
+				} else if current.hash == hash && keysEqual(current.key, key) {
 					if b := current.value.Load(); b != nil && b.isSimple() && b.typ == newTyp && newTyp != 0 {
 						if _, published := b.swapData((*byte)(newData)); published {
 							return
@@ -809,12 +900,13 @@ func (m *Map) Store(key Key, value any) {
 	foundExisting := false
 	for probes := 0; probes <= mask; probes++ {
 		c := ctrlLoad(ctrl, idx)
-		if c == 0 {
-			break
-		}
-		if c == fp {
+		if c == fp || c == 0 {
 			current := currentTable.slots[idx].entry.Load()
-			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+			if current == nil {
+				if c == 0 {
+					break
+				}
+			} else if current.hash == hash && keysEqual(current.key, key) {
 				foundExisting = true
 				existing := current.value.Load()
 				if existing != nil && existing.expires() == 0 && existing.hitsLoad() >= 0 {
@@ -917,12 +1009,13 @@ func (m *Map) Load(key Key) (any, bool) {
 	mask := int(currentTable.mask)
 	for probes := 0; probes <= mask; probes++ {
 		c := ctrlLoad(ctrl, index)
-		if c == 0 {
-			return nil, false
-		}
-		if c == fp {
+		if c == fp || c == 0 {
 			current := slots[index].entry.Load()
-			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+			if current == nil {
+				if c == 0 {
+					return nil, false
+				}
+			} else if current.hash == hash && keysEqual(current.key, key) {
 				boxed := current.value.Load()
 				if boxed == nil {
 					return nil, false
@@ -941,7 +1034,7 @@ func (m *Map) Load(key Key) (any, bool) {
 						return s.readEntryConsumeHit(current, boxed)
 					}
 					if hits < 0 {
-						if s.clearIfMatch(current, boxed, false, true) {
+						if s.reap(current, boxed, false, true) {
 							s.maybeResize()
 						}
 						return nil, false
@@ -985,12 +1078,13 @@ func (m *Map) Peek(key Key) (any, bool) {
 	mask := int(currentTable.mask)
 	for probes := 0; probes <= mask; probes++ {
 		c := ctrlLoad(ctrl, index)
-		if c == 0 {
-			return nil, false
-		}
-		if c == fp {
+		if c == fp || c == 0 {
 			current := slots[index].entry.Load()
-			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+			if current == nil {
+				if c == 0 {
+					return nil, false
+				}
+			} else if current.hash == hash && keysEqual(current.key, key) {
 				boxed := current.value.Load()
 				if boxed == nil {
 					return nil, false
@@ -1037,18 +1131,19 @@ func (m *Map) Has(key Key) bool {
 	mask := int(currentTable.mask)
 	for probes := 0; probes <= mask; probes++ {
 		c := ctrlLoad(ctrl, index)
-		if c == 0 {
-			return false
-		}
-		if c == fp {
+		if c == fp || c == 0 {
 			current := slots[index].entry.Load()
-			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+			if current == nil {
+				if c == 0 {
+					return false
+				}
+			} else if current.hash == hash && keysEqual(current.key, key) {
 				boxed := current.value.Load()
 				if boxed == nil {
 					return false
 				}
 				if boxed.isSimple() {
-					return true
+					return !boxed.claimed()
 				}
 				if boxed.expires() == 0 {
 					return boxed.hitsLoad() >= 0
@@ -1098,12 +1193,13 @@ func (m *Map) LoadOrStore(key Key, value any) (any, bool) {
 	mask := int(currentTable.mask)
 	for probes := 0; probes <= mask; probes++ {
 		c := ctrlLoad(ctrl, idx)
-		if c == 0 {
-			break
-		}
-		if c == fp {
+		if c == fp || c == 0 {
 			current := currentTable.slots[idx].entry.Load()
-			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+			if current == nil {
+				if c == 0 {
+					break
+				}
+			} else if current.hash == hash && keysEqual(current.key, key) {
 				existing := current.value.Load()
 				if existing != nil && (existing.isSimple() || (existing.expires() == 0 && existing.hitsLoad() == 0)) {
 					if value, live := existing.liveVal(); live {
@@ -1159,12 +1255,13 @@ func (m *Map) Swap(key Key, value any) (any, bool) {
 		mask := int(currentTable.mask)
 		for probes := 0; probes <= mask; probes++ {
 			c := ctrlLoad(ctrl, idx)
-			if c == 0 {
-				break
-			}
-			if c == fp {
+			if c == fp || c == 0 {
 				current := currentTable.slots[idx].entry.Load()
-				if current != nil && current.hash == hash && keysEqual(current.key, key) {
+				if current == nil {
+					if c == 0 {
+						break
+					}
+				} else if current.hash == hash && keysEqual(current.key, key) {
 					if b := current.value.Load(); b != nil && b.isSimple() && b.typ == newTyp && newTyp != 0 {
 						if oldData, published := b.swapData((*byte)(newData)); published {
 							return ifaceFromWords(newTyp, unsafe.Pointer(oldData)), true
@@ -1212,12 +1309,13 @@ func (m *Map) CompareAndSwap(key Key, oldValue any, newValue any) bool {
 	mask := int(currentTable.mask)
 	for probes := 0; probes <= mask; probes++ {
 		c := ctrlLoad(ctrl, idx)
-		if c == 0 {
-			return false
-		}
-		if c == fp {
+		if c == fp || c == 0 {
 			current := currentTable.slots[idx].entry.Load()
-			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+			if current == nil {
+				if c == 0 {
+					return false
+				}
+			} else if current.hash == hash && keysEqual(current.key, key) {
 				existing := current.value.Load()
 				if existing == nil {
 					return false
@@ -1225,12 +1323,18 @@ func (m *Map) CompareAndSwap(key Key, oldValue any, newValue any) bool {
 				if existing.expires() != 0 || existing.hitsLoad() < 0 {
 					break
 				}
-				value, live := existing.liveVal()
+				data, value, live := existing.liveData()
 				if !live {
 					return false
 				}
 				if !valuesEqual(value, oldValue) {
 					return false
+				}
+				if m.noClone && existing.isSimple() {
+					if newTyp, newData := ifaceWords(newValue); newTyp != 0 && newTyp == existing.typ &&
+						existing.data.CompareAndSwap(data, (*byte)(newData)) {
+						return true
+					}
 				}
 				boxed := m.newValueBox(newValue, EntryOptions{})
 				return s.compareAndSwap(hash, key, oldValue, boxed)
@@ -1311,36 +1415,10 @@ func (m *Map) Range(visitor func(key Key, value any) bool) {
 		return
 	}
 
-	// Estimate total live entries to decide parallel strategy.
-	var totalLive int64
-	for i := range m.shards {
-		totalLive += m.shards[i].live.Load()
-	}
-	if totalLive < parallelRangeThreshold {
-		for i := range m.shards {
-			if !rangeShardSequential(&m.shards[i], visitor) {
-				return
-			}
-		}
+	workers := m.rangeWorkers()
+	if workers <= 1 {
+		m.rangeSequential(visitor)
 		return
-	}
-
-	// Pick worker count adaptively. Spawning one goroutine per shard wastes
-	// thousands of spawns on big maps; bounding to GOMAXPROCS makes each worker
-	// blow past L2 and become memory-bandwidth-bound. Empirically GOMAXPROCS×4
-	// goroutines, each handling a contiguous chunk of shards, hits the sweet
-	// spot: per-worker working set fits in L2 and Go's scheduler keeps the
-	// cores saturated.
-	procs := runtime.GOMAXPROCS(0)
-	workers := procs * 4
-	if workers > n {
-		workers = n
-	}
-	if maxByWork := int(totalLive / minRangeEntriesPerWorker); workers > maxByWork {
-		workers = maxByWork
-	}
-	if workers < 1 {
-		workers = 1
 	}
 
 	slabs := acquireRangeSlabs(workers)
@@ -1400,29 +1478,10 @@ func (m *Map) RangePar(visitor func(key Key, value any) bool) {
 		return
 	}
 
-	var totalLive int64
-	for i := range m.shards {
-		totalLive += m.shards[i].live.Load()
-	}
-	if totalLive < parallelRangeThreshold {
-		for i := range m.shards {
-			if !rangeShardSequential(&m.shards[i], visitor) {
-				return
-			}
-		}
+	workers := m.rangeWorkers()
+	if workers <= 1 {
+		m.rangeSequential(visitor)
 		return
-	}
-
-	procs := runtime.GOMAXPROCS(0)
-	workers := procs * 4
-	if workers > n {
-		workers = n
-	}
-	if maxByWork := int(totalLive / minRangeEntriesPerWorker); workers > maxByWork {
-		workers = maxByWork
-	}
-	if workers < 1 {
-		workers = 1
 	}
 
 	var stopped atomic.Bool
@@ -1455,6 +1514,29 @@ func (m *Map) Snapshot() []Pair {
 		return true
 	})
 	return pairs
+}
+
+func (m *Map) rangeWorkers() int {
+	procs := runtime.GOMAXPROCS(0)
+	if procs < 2 || len(m.shards) < 2 {
+		return 1
+	}
+	var totalLive int64
+	for i := range m.shards {
+		totalLive += m.shards[i].live.Load()
+	}
+	if totalLive < parallelRangeThreshold {
+		return 1
+	}
+	return max(1, min(procs*4, len(m.shards), int(totalLive/minRangeEntriesPerWorker)))
+}
+
+func (m *Map) rangeSequential(visitor func(key Key, value any) bool) {
+	for i := range m.shards {
+		if !rangeShardSequential(&m.shards[i], visitor) {
+			return
+		}
+	}
 }
 
 // Stats returns a point-in-time snapshot of aggregated operational metrics.
@@ -1557,7 +1639,7 @@ func (s *shard) readEntry(current *entry, consumeHits bool) (any, bool) {
 			return s.readEntryConsumeHit(current, boxed)
 		}
 		if hits < 0 {
-			if s.clearIfMatch(current, boxed, false, true) {
+			if s.reap(current, boxed, false, true) {
 				s.maybeResize()
 			}
 			return nil, false
@@ -1572,7 +1654,7 @@ func (s *shard) readEntryConsumeHit(current *entry, boxed *valueBox) (any, bool)
 	for {
 		consumed, exhausted := boxed.consumeHit()
 		if !consumed {
-			if s.clearIfMatch(current, boxed, false, true) {
+			if s.reap(current, boxed, false, true) {
 				s.maybeResize()
 				return nil, false
 			}
@@ -1584,7 +1666,7 @@ func (s *shard) readEntryConsumeHit(current *entry, boxed *valueBox) (any, bool)
 		}
 		value, live := boxed.liveVal()
 		if exhausted {
-			s.clearIfMatch(current, boxed, false, true)
+			s.reap(current, boxed, false, true)
 			s.maybeResize()
 		}
 		return value, live
@@ -1603,7 +1685,7 @@ func (s *shard) readEntrySlow(current *entry, consumeHits bool) (any, bool) {
 		}
 
 		if boxed.expires() > 0 && time.Now().UnixNano() >= boxed.expires() {
-			if s.clearIfMatch(current, boxed, true, false) {
+			if s.reap(current, boxed, true, false) {
 				s.maybeResize()
 				return nil, false
 			}
@@ -1612,7 +1694,7 @@ func (s *shard) readEntrySlow(current *entry, consumeHits bool) (any, bool) {
 
 		if !consumeHits {
 			if boxed.hitsLoad() < 0 {
-				if s.clearIfMatch(current, boxed, false, true) {
+				if s.reap(current, boxed, false, true) {
 					s.maybeResize()
 					return nil, false
 				}
@@ -1623,7 +1705,7 @@ func (s *shard) readEntrySlow(current *entry, consumeHits bool) (any, bool) {
 
 		consumed, exhausted := boxed.consumeHit()
 		if !consumed {
-			if s.clearIfMatch(current, boxed, false, true) {
+			if s.reap(current, boxed, false, true) {
 				s.maybeResize()
 				return nil, false
 			}
@@ -1632,7 +1714,7 @@ func (s *shard) readEntrySlow(current *entry, consumeHits bool) (any, bool) {
 
 		value, live := boxed.liveVal()
 		if exhausted {
-			s.clearIfMatch(current, boxed, false, true)
+			s.reap(current, boxed, false, true)
 			s.maybeResize()
 		}
 		return value, live
@@ -1645,8 +1727,13 @@ outer:
 		s.beginWrite()
 		currentTable := s.table.Load()
 		index := int(hash & currentTable.mask)
+		fp := fingerprint(hash)
 
 		for probes := 0; probes < len(currentTable.slots); probes++ {
+			if otherKeySlot(currentTable.ctrl, index, fp) {
+				index = (index + 1) & int(currentTable.mask)
+				continue
+			}
 			current := currentTable.slots[index].entry.Load()
 			if current == nil {
 				inserted, retry, resizeNeeded := s.insertFresh(currentTable, index, hash, key, boxed)
@@ -1688,12 +1775,13 @@ func (s *shard) loadOrStoreDeferred(hash uint64, key Key, value any, options Ent
 	mask := int(currentTable.mask)
 	for probes := 0; probes <= mask; probes++ {
 		c := ctrlLoad(currentTable.ctrl, idx)
-		if c == 0 {
-			break
-		}
-		if c == fp {
+		if c == fp || c == 0 {
 			current := currentTable.slots[idx].entry.Load()
-			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+			if current == nil {
+				if c == 0 {
+					break
+				}
+			} else if current.hash == hash && keysEqual(current.key, key) {
 				existing := current.value.Load()
 				if existing != nil && existing.expires() == 0 && existing.hitsLoad() == 0 {
 					if value, live := existing.liveVal(); live {
@@ -1718,6 +1806,10 @@ outer:
 		fp := fingerprint(hash)
 
 		for probes := 0; probes < len(currentTable.slots); probes++ {
+			if otherKeySlot(currentTable.ctrl, index, fp) {
+				index = (index + 1) & int(currentTable.mask)
+				continue
+			}
 			current := currentTable.slots[index].entry.Load()
 			if current == nil {
 				var cloned any
@@ -1727,10 +1819,9 @@ outer:
 				} else {
 					cloned = value
 				}
-				bundle := s.newBundle()
-				bundle.ent.hash = hash
-				bundle.ent.key = cloneKey(key)
-				bundle.box.setVal(cloned)
+				ent, box := s.allocBundle(key)
+				ent.hash = hash
+				box.setVal(cloned)
 				if trackedBytes != 0 || options.Hits > 0 || options.TTL > 0 {
 					meta := &valueMeta{clonedBytes: trackedBytes}
 					if options.Hits > 0 {
@@ -1739,11 +1830,11 @@ outer:
 					if options.TTL > 0 {
 						meta.expiresAt = time.Now().Add(options.TTL).UnixNano()
 					}
-					bundle.box.meta = meta
+					box.meta = meta
 				}
-				bundle.ent.value.Store(&bundle.box)
+				ent.value.Store(box)
 
-				if currentTable.slots[index].entry.CompareAndSwap(nil, &bundle.ent) {
+				if currentTable.slots[index].entry.CompareAndSwap(nil, ent) {
 					ctrlStore(currentTable.ctrl, index, fp)
 					s.live.Add(1)
 					used := s.used.Add(1)
@@ -1751,7 +1842,7 @@ outer:
 					if trackedBytes > 0 {
 						s.valueBytes.Add(trackedBytes)
 					}
-					if bundle.box.requiresCleanup() {
+					if box.requiresCleanup() {
 						s.needsCleanup.Store(true)
 					}
 					resizeNeeded := used >= int64(currentTable.growAt)
@@ -1839,8 +1930,13 @@ outer:
 		s.beginWrite()
 		currentTable := s.table.Load()
 		index := int(hash & currentTable.mask)
+		fp := fingerprint(hash)
 
 		for probes := 0; probes < len(currentTable.slots); probes++ {
+			if otherKeySlot(currentTable.ctrl, index, fp) {
+				index = (index + 1) & int(currentTable.mask)
+				continue
+			}
 			current := currentTable.slots[index].entry.Load()
 			if current == nil {
 				inserted, retry, resizeNeeded := s.insertFresh(currentTable, index, hash, key, boxed)
@@ -1919,6 +2015,10 @@ func (s *shard) delete(hash uint64, key Key) (any, bool) {
 			if boxed.isSimple() {
 				deletedValue, claimed := boxed.claim()
 				if !claimed {
+					if boxed.moving() {
+						runtime.Gosched()
+						continue
+					}
 					s.endWrite()
 					return nil, false
 				}
@@ -2017,8 +2117,30 @@ func (s *shard) compareAndSwap(hash uint64, key Key, oldValue any, boxed *valueB
 
 			if existing.sameShape(boxed) {
 				if !existing.replaceData(data, boxed) {
+					if existing.moving() {
+						runtime.Gosched()
+					}
 					continue
 				}
+				resizeNeeded := s.shouldResizeWithTable(currentTable)
+				s.endWrite()
+				if resizeNeeded {
+					s.resize(int(s.live.Load()))
+				}
+				return true
+			}
+
+			if existing.isSimple() {
+				_, outcome := existing.claimForMove(data, true)
+				if outcome == moveRemoved {
+					s.endWrite()
+					return false
+				}
+				if outcome != moveClaimed {
+					runtime.Gosched()
+					continue
+				}
+				s.installMoved(current, existing, boxed)
 				resizeNeeded := s.shouldResizeWithTable(currentTable)
 				s.endWrite()
 				if resizeNeeded {
@@ -2096,6 +2218,9 @@ func (s *shard) compareAndDelete(hash uint64, key Key, oldValue any) bool {
 
 			if existing.isSimple() {
 				if !existing.claimData(data) {
+					if existing.moving() {
+						runtime.Gosched()
+					}
 					continue
 				}
 				if current.value.CompareAndSwap(existing, nil) {
@@ -2133,14 +2258,14 @@ func (s *shard) clear() {
 	for {
 		old := s.state.Load()
 		if old&shardResizing != 0 {
-			runtime.Gosched()
+			s.awaitResize()
 			continue
 		}
 		if s.state.CompareAndSwap(old, old|shardResizing) {
 			break
 		}
 	}
-	defer s.state.Add(-shardResizing)
+	defer s.finishResize(s.publishResize())
 
 	spins := int64(0)
 	for s.state.Load() != shardResizing {
@@ -2196,7 +2321,7 @@ func (s *shard) beginWriteSlow() {
 		for s.state.Load()&shardResizing != 0 {
 			spins++
 			if spins%resizeSpinYieldInterval == 0 {
-				runtime.Gosched()
+				s.awaitResize()
 			}
 		}
 
@@ -2211,8 +2336,28 @@ func (s *shard) beginWriteSlow() {
 		s.state.Add(-1)
 		spins++
 		if spins%resizeSpinYieldInterval == 0 {
-			runtime.Gosched()
+			s.awaitResize()
 		}
+	}
+}
+
+func (s *shard) publishResize() chan struct{} {
+	done := make(chan struct{})
+	s.resizeDone.Store(&done)
+	return done
+}
+
+func (s *shard) finishResize(done chan struct{}) {
+	s.state.Add(-shardResizing)
+	close(done)
+}
+
+func (s *shard) awaitResize() {
+	if done := s.resizeDone.Load(); done != nil {
+		<-*done
+	}
+	if s.state.Load()&shardResizing != 0 {
+		runtime.Gosched()
 	}
 }
 
@@ -2248,16 +2393,20 @@ outer:
 		s.beginWrite()
 		currentTable := s.table.Load()
 		index := int(hash & currentTable.mask)
+		fp := fingerprint(hash)
 
 		for probes := 0; probes < len(currentTable.slots); probes++ {
+			if otherKeySlot(currentTable.ctrl, index, fp) {
+				index = (index + 1) & int(currentTable.mask)
+				continue
+			}
 			current := currentTable.slots[index].entry.Load()
 			if current == nil {
-				bundle := s.newBundle()
-				bundle.ent.hash = hash
-				bundle.ent.key = cloneKey(key)
-				bundle.box.setVal(value)
-				bundle.ent.value.Store(&bundle.box)
-				if currentTable.slots[index].entry.CompareAndSwap(nil, &bundle.ent) {
+				ent, box := s.allocBundle(key)
+				ent.hash = hash
+				box.setVal(value)
+				ent.value.Store(box)
+				if currentTable.slots[index].entry.CompareAndSwap(nil, ent) {
 					ctrlStore(currentTable.ctrl, index, fingerprint(hash))
 					s.live.Add(1)
 					used := s.used.Add(1)
@@ -2322,12 +2471,40 @@ func (s *shard) replaceOrRevive(current *entry, boxed *valueBox) (any, bool) {
 			continue
 		}
 
+		if existing.sameShape(boxed) {
+			if prevData, published := existing.swapData(boxed.data.Load()); published {
+				return ifaceFromWords(existing.typ, unsafe.Pointer(prevData)), true
+			}
+			if existing.moving() {
+				runtime.Gosched()
+				continue
+			}
+			if current.value.CompareAndSwap(existing, boxed) {
+				return nil, false
+			}
+			continue
+		}
+
+		if existing.isSimple() {
+			prevData, outcome := existing.claimForMove(nil, false)
+			switch outcome {
+			case moveClaimed:
+				s.installMoved(current, existing, boxed)
+				return ifaceFromWords(existing.typ, unsafe.Pointer(prevData)), true
+			case moveRemoved:
+				if current.value.CompareAndSwap(existing, boxed) {
+					s.accountReplacement(existing, boxed)
+					return nil, false
+				}
+			default:
+				runtime.Gosched()
+			}
+			continue
+		}
+
 		previous, live := existing.liveVal()
 		if current.value.CompareAndSwap(existing, boxed) {
-			s.valueBytes.Add(boxed.cloned() - existing.cloned())
-			if boxed.requiresCleanup() {
-				s.needsCleanup.Store(true)
-			}
+			s.accountReplacement(existing, boxed)
 			if !live {
 				return nil, false
 			}
@@ -2336,7 +2513,21 @@ func (s *shard) replaceOrRevive(current *entry, boxed *valueBox) (any, bool) {
 	}
 }
 
+func (s *shard) accountReplacement(existing *valueBox, boxed *valueBox) {
+	s.valueBytes.Add(boxed.cloned() - existing.cloned())
+	if boxed.requiresCleanup() {
+		s.needsCleanup.Store(true)
+	}
+}
+
+func (s *shard) installMoved(current *entry, moved *valueBox, boxed *valueBox) {
+	if current.value.CompareAndSwap(moved, boxed) {
+		s.accountReplacement(moved, boxed)
+	}
+}
+
 func (s *shard) loadOrStoreCurrent(current *entry, boxed *valueBox) (any, bool) {
+	stored, _ := boxed.liveVal()
 	for {
 		existing := current.value.Load()
 		if existing == nil {
@@ -2348,7 +2539,6 @@ func (s *shard) loadOrStoreCurrent(current *entry, boxed *valueBox) (any, bool) 
 				if boxed.requiresCleanup() {
 					s.needsCleanup.Store(true)
 				}
-				stored, _ := boxed.liveVal()
 				return stored, false
 			}
 			continue
@@ -2375,7 +2565,6 @@ func (s *shard) loadOrStoreCurrent(current *entry, boxed *valueBox) (any, bool) 
 				if boxed.requiresCleanup() {
 					s.needsCleanup.Store(true)
 				}
-				stored, _ := boxed.liveVal()
 				return stored, false
 			}
 			continue
@@ -2383,6 +2572,15 @@ func (s *shard) loadOrStoreCurrent(current *entry, boxed *valueBox) (any, bool) 
 
 		return value, true
 	}
+}
+
+func (s *shard) reap(current *entry, boxed *valueBox, expired bool, depleted bool) bool {
+	s.beginWrite()
+	defer s.endWrite()
+	if findEntry(s.table.Load(), current.hash, current.key) != current {
+		return true
+	}
+	return s.clearIfMatch(current, boxed, expired, depleted)
 }
 
 func (s *shard) clearIfMatch(current *entry, boxed *valueBox, expired bool, depleted bool) bool {
@@ -2422,7 +2620,7 @@ func (s *shard) resizeAt(minLiveEntries int, now int64, force bool) {
 	if !s.state.CompareAndSwap(old, old|shardResizing) {
 		return
 	}
-	defer s.state.Add(-shardResizing)
+	defer s.finishResize(s.publishResize())
 
 	spins := int64(0)
 	for s.state.Load() != shardResizing {
@@ -2440,81 +2638,100 @@ func (s *shard) resizeAt(minLiveEntries int, now int64, force bool) {
 		return
 	}
 
-	actualLive := 0
-	var keyBytes int64
-	var valueBytes int64
-	var expiredRemoved int64
-	var hitRemoved int64
-	needsCleanup := false
-
-	for index := range currentTable.slots {
-		current := currentTable.slots[index].entry.Load()
-		if current == nil {
-			continue
-		}
-		boxed := current.value.Load()
-		if boxed == nil {
-			continue
-		}
-		if boxed.expires() > 0 {
-			needsCleanup = true
-			if now >= boxed.expires() {
-				expiredRemoved++
-				continue
-			}
-		}
-		hits := boxed.hitsLoad()
-		if hits != 0 {
-			needsCleanup = true
-			if hits < 0 {
-				hitRemoved++
-				continue
-			}
-		}
-		actualLive++
-		keyBytes += keySize(current.key)
-		valueBytes += boxed.cloned()
+	sizeFor := int(s.live.Load())
+	if force {
+		sizeFor = admissibleEntries(currentTable, now)
 	}
-
-	targetLive := actualLive
-	if targetLive < minLiveEntries {
-		targetLive = minLiveEntries
-	}
-	if targetLive < 1 {
-		targetLive = 1
-	}
-
-	newSlotCount := s.targetSlotCount(currentTable, targetLive, force)
-	rebuilt := newTableWithSlots(newSlotCount, s.loadFactor)
-	for index := range currentTable.slots {
-		current := currentTable.slots[index].entry.Load()
-		if current == nil {
-			continue
-		}
-		boxed := current.value.Load()
-		if boxed == nil {
-			continue
-		}
-		if boxed.expires() > 0 && now >= boxed.expires() {
-			continue
-		}
-		if hits := boxed.hitsLoad(); hits < 0 {
-			continue
-		}
-
-		rebuilt.insertClone(current)
+	slotCount := s.targetSlotCount(currentTable, max(sizeFor, minLiveEntries, 1), force)
+	rebuilt, tally, ok := rebuildInto(currentTable, slotCount, s.loadFactor, now)
+	for !ok {
+		exact := max(admissibleEntries(currentTable, now), int(tally.live), minLiveEntries, 1)
+		slotCount = max(s.targetSlotCount(currentTable, exact, true), slotsForEntries(exact*2, s.loadFactor))
+		rebuilt, tally, ok = rebuildInto(currentTable, slotCount, s.loadFactor, now)
 	}
 
 	s.table.Store(rebuilt)
-	s.live.Store(int64(actualLive))
-	s.used.Store(int64(actualLive))
+	s.live.Store(tally.live)
+	s.used.Store(tally.live)
 	s.tombstones.Store(0)
-	s.keyBytes.Store(keyBytes)
-	s.valueBytes.Store(valueBytes)
-	s.expiredDeletes.Add(expiredRemoved)
-	s.hitDeletes.Add(hitRemoved)
-	s.needsCleanup.Store(needsCleanup)
+	s.keyBytes.Store(tally.keyBytes)
+	s.valueBytes.Store(tally.valueBytes)
+	s.expiredDeletes.Add(tally.expired)
+	s.hitDeletes.Add(tally.hitGone)
+	s.needsCleanup.Store(tally.needsCleanup)
 	s.resizes.Add(1)
+}
+
+type rebuildTally struct {
+	live         int64
+	expired      int64
+	hitGone      int64
+	keyBytes     int64
+	valueBytes   int64
+	needsCleanup bool
+}
+
+func (t *rebuildTally) admit(current *entry, now int64) bool {
+	boxed := current.value.Load()
+	if boxed == nil {
+		return false
+	}
+	if boxed.expires() > 0 {
+		t.needsCleanup = true
+		if now >= boxed.expires() {
+			t.expired++
+			return false
+		}
+	}
+	if hits := boxed.hitsLoad(); hits != 0 {
+		t.needsCleanup = true
+		if hits < 0 {
+			t.hitGone++
+			return false
+		}
+	}
+	t.live++
+	t.keyBytes += keySize(current.key)
+	t.valueBytes += boxed.cloned()
+	return true
+}
+
+const rebuildPrefetchDistance = 8
+
+func prefetchEntryAhead(slots []slot, index int) {
+	if ahead := index + rebuildPrefetchDistance; ahead < len(slots) {
+		if next := slots[ahead].entry.Load(); next != nil {
+			prefetchT0(unsafe.Pointer(next))
+		}
+	}
+}
+
+func admissibleEntries(currentTable *table, now int64) int {
+	var tally rebuildTally
+	for index := range currentTable.slots {
+		prefetchEntryAhead(currentTable.slots, index)
+		if current := currentTable.slots[index].entry.Load(); current != nil {
+			tally.admit(current, now)
+		}
+	}
+	return int(tally.live)
+}
+
+func rebuildInto(currentTable *table, slotCount int, loadFactor float64, now int64) (*table, rebuildTally, bool) {
+	rebuilt := newTableWithSlots(slotCount, loadFactor)
+	var tally rebuildTally
+	for index := range currentTable.slots {
+		prefetchEntryAhead(currentTable.slots, index)
+		current := currentTable.slots[index].entry.Load()
+		if current == nil || !tally.admit(current, now) {
+			continue
+		}
+		if tally.live > int64(rebuilt.growAt) {
+			return nil, tally, false
+		}
+		rebuilt.insertClone(current)
+	}
+	return rebuilt, tally, true
 }
 
 func (s *shard) targetSlotCount(currentTable *table, liveEntries int, force bool) int {
@@ -2522,19 +2739,24 @@ func (s *shard) targetSlotCount(currentTable *table, liveEntries int, force bool
 	if required < s.initialSlots {
 		required = s.initialSlots
 	}
+	roomy := maxInt(slotsForEntries(liveEntries*2, s.loadFactor), s.initialSlots)
 	target := len(currentTable.slots)
 	used := int(s.used.Load())
 	tombstones := int(s.tombstones.Load())
 
 	switch {
 	case used >= currentTable.growAt || required > target:
-		target = maxInt(target<<2, required)
+		if roomy <= target {
+			target = roomy
+		} else {
+			target = maxInt(target<<2, roomy)
+		}
 	case target > s.initialSlots && tombstones > 0 && tombstones*4 >= maxInt(used, 1):
-		target = required
+		target = min(target, roomy)
 	case target > s.initialSlots && required*2 < target:
-		target = required
-	case force && target > s.initialSlots && required < target:
-		target = required
+		target = roomy
+	case force && target > s.initialSlots && roomy < target:
+		target = roomy
 	}
 
 	if target < s.initialSlots {
@@ -2570,7 +2792,7 @@ func (s *shard) shouldShrink(currentTable *table, liveEntries int) bool {
 func (t *table) insertClone(current *entry) {
 	index := int(current.hash & t.mask)
 	for {
-		if t.slots[index].entry.Load() == nil {
+		if ctrlLoad(t.ctrl, index) == 0 {
 			t.slots[index].entry.Store(current)
 			ctrlStore(t.ctrl, index, fingerprint(current.hash))
 			return
@@ -2587,12 +2809,13 @@ func findEntry(currentTable *table, hash uint64, key Key) *entry {
 	mask := int(currentTable.mask)
 	for probes := 0; probes <= mask; probes++ {
 		c := ctrlLoad(ctrl, index)
-		if c == 0 {
-			return nil
-		}
-		if c == fp {
+		if c == fp || c == 0 {
 			current := slots[index].entry.Load()
-			if current != nil && current.hash == hash && keysEqual(current.key, key) {
+			if current == nil {
+				if c == 0 {
+					return nil
+				}
+			} else if current.hash == hash && keysEqual(current.key, key) {
 				return current
 			}
 		}
@@ -2603,6 +2826,11 @@ func findEntry(currentTable *table, hash uint64, key Key) *entry {
 
 func fingerprint(hash uint64) uint32 {
 	return uint32(hash>>56) | 1
+}
+
+func otherKeySlot(ctrl []uint32, index int, fp uint32) bool {
+	c := ctrlLoad(ctrl, index)
+	return c != 0 && c != fp
 }
 
 func ctrlLoad(ctrl []uint32, i int) uint32 {

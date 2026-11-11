@@ -139,7 +139,7 @@ func (m *TypedMap[K, V]) putMeta(key K, val V, md *typedMeta) {
 		e := t.slots[idx].Load()
 		if e == nil {
 			ne := s.newEntry()
-			ne.hash = h
+			ne.hash = uint32(h)
 			ne.key = key
 			m.storeVal(ne, val)
 			ne.meta.Store(md)
@@ -164,9 +164,11 @@ func (m *TypedMap[K, V]) putMeta(key K, val V, md *typedMeta) {
 			if firstTomb < 0 {
 				firstTomb = int(idx)
 			}
-		} else if e.hash == h && e.key == key {
+		} else if e.hash == uint32(h) && e.key == key {
+			e.lockValue()
 			m.storeVal(e, val)
 			e.meta.Store(md)
+			e.unlockValue()
 			s.mu.Unlock()
 			return
 		}
@@ -210,7 +212,7 @@ func (m *TypedMap[K, V]) loadOrStoreMeta(key K, val V, md *typedMeta) (V, bool) 
 		e := t.slots[idx].Load()
 		if e == nil {
 			ne := s.newEntry()
-			ne.hash = h
+			ne.hash = uint32(h)
 			ne.key = key
 			m.storeVal(ne, val)
 			ne.meta.Store(md)
@@ -235,14 +237,16 @@ func (m *TypedMap[K, V]) loadOrStoreMeta(key K, val V, md *typedMeta) (V, bool) 
 			if firstTomb < 0 {
 				firstTomb = int(idx)
 			}
-		} else if e.hash == h && e.key == key {
+		} else if e.hash == uint32(h) && e.key == key {
 			if emd := e.meta.Load(); emd == nil || !emd.deadForView(time.Now().UnixNano()) {
 				v := m.loadVal(e)
 				s.mu.Unlock()
 				return v, true
 			}
+			e.lockValue()
 			m.storeVal(e, val)
 			e.meta.Store(md)
+			e.unlockValue()
 			s.mu.Unlock()
 			return val, false
 		}
@@ -253,6 +257,16 @@ func (m *TypedMap[K, V]) loadOrStoreMeta(key K, val V, md *typedMeta) (V, bool) 
 // Swap stores val for key and returns the previous value with true, or the zero V
 // and false when the key was absent or expired.
 func (m *TypedMap[K, V]) Swap(key K, val V) (V, bool) {
+	h := m.hash(key)
+	s := &m.shards[(h>>32)&m.shardMask]
+	if e := m.find(s.table.Load(), h, key); e != nil && e.enterFast() {
+		if e.meta.Load() == nil {
+			prev := m.swapVal(e, val)
+			e.exitFast()
+			return prev, true
+		}
+		e.exitFast()
+	}
 	return m.swapMeta(key, val, nil)
 }
 
@@ -281,7 +295,7 @@ func (m *TypedMap[K, V]) swapMeta(key K, val V, md *typedMeta) (V, bool) {
 		e := t.slots[idx].Load()
 		if e == nil {
 			ne := s.newEntry()
-			ne.hash = h
+			ne.hash = uint32(h)
 			ne.key = key
 			m.storeVal(ne, val)
 			ne.meta.Store(md)
@@ -308,7 +322,8 @@ func (m *TypedMap[K, V]) swapMeta(key K, val V, md *typedMeta) (V, bool) {
 			if firstTomb < 0 {
 				firstTomb = int(idx)
 			}
-		} else if e.hash == h && e.key == key {
+		} else if e.hash == uint32(h) && e.key == key {
+			e.lockValue()
 			prev := m.loadVal(e)
 			prevDead := false
 			if pmd := e.meta.Load(); pmd != nil && pmd.deadForView(time.Now().UnixNano()) {
@@ -316,6 +331,7 @@ func (m *TypedMap[K, V]) swapMeta(key K, val V, md *typedMeta) (V, bool) {
 			}
 			m.storeVal(e, val)
 			e.meta.Store(md)
+			e.unlockValue()
 			s.mu.Unlock()
 			if prevDead {
 				var zero V
@@ -335,10 +351,33 @@ const (
 	DeleteOp
 )
 
+const computeFastAttempts = 2
+
 func (m *TypedMap[K, V]) Compute(key K, fn func(oldValue V, loaded bool) (newValue V, op ComputeOp)) (V, bool) {
 	var zero V
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
+	if e := m.find(s.table.Load(), h, key); e != nil {
+		for attempt := 0; attempt < computeFastAttempts && e.meta.Load() == nil; attempt++ {
+			old := m.loadVal(e)
+			newValue, op := fn(old, true)
+			if op == CancelOp {
+				return old, true
+			}
+			if op != UpdateOp || !e.enterFast() {
+				break
+			}
+			if e.meta.Load() != nil {
+				e.exitFast()
+				break
+			}
+			swapped := m.casVal(e, old, newValue)
+			e.exitFast()
+			if swapped {
+				return newValue, true
+			}
+		}
+	}
 
 	s.mu.Lock()
 	t := s.table.Load()
@@ -357,7 +396,7 @@ func (m *TypedMap[K, V]) Compute(key K, fn func(oldValue V, loaded bool) (newVal
 				return zero, false
 			}
 			ne := s.newEntry()
-			ne.hash = h
+			ne.hash = uint32(h)
 			ne.key = key
 			m.storeVal(ne, newValue)
 			if firstTomb >= 0 {
@@ -381,41 +420,8 @@ func (m *TypedMap[K, V]) Compute(key K, fn func(oldValue V, loaded bool) (newVal
 			if firstTomb < 0 {
 				firstTomb = int(idx)
 			}
-		} else if e.hash == h && e.key == key {
-			if !m.valPtr {
-				for {
-					ob := e.bits.Load()
-					old := zero
-					loaded := true
-					if md := e.meta.Load(); md != nil && md.deadForView(time.Now().UnixNano()) {
-						loaded = false
-					} else {
-						old = fromBits[V](ob)
-					}
-					newValue, op := fn(old, loaded)
-					switch op {
-					case UpdateOp:
-						if !e.bits.CompareAndSwap(ob, toBits(newValue)) {
-							continue
-						}
-						if e.meta.Load() != nil {
-							e.meta.Store(nil)
-						}
-						s.mu.Unlock()
-						return newValue, true
-					case DeleteOp:
-						if t.slots[idx].CompareAndSwap(e, m.tomb) {
-							t.count.Add(-1)
-							t.tombstones.Add(1)
-						}
-						s.mu.Unlock()
-						return old, false
-					default:
-						s.mu.Unlock()
-						return old, loaded
-					}
-				}
-			}
+		} else if e.hash == uint32(h) && e.key == key {
+			e.lockValue()
 			old := zero
 			loaded := true
 			if md := e.meta.Load(); md != nil && md.deadForView(time.Now().UnixNano()) {
@@ -430,16 +436,17 @@ func (m *TypedMap[K, V]) Compute(key K, fn func(oldValue V, loaded bool) (newVal
 				if e.meta.Load() != nil {
 					e.meta.Store(nil)
 				}
+				e.unlockValue()
 				s.mu.Unlock()
 				return newValue, true
 			case DeleteOp:
-				if t.slots[idx].CompareAndSwap(e, m.tomb) {
-					t.count.Add(-1)
-					t.tombstones.Add(1)
-				}
+				t.slots[idx].Store(m.tomb)
+				t.count.Add(-1)
+				t.tombstones.Add(1)
 				s.mu.Unlock()
 				return old, false
 			default:
+				e.unlockValue()
 				s.mu.Unlock()
 				return old, loaded
 			}
@@ -453,6 +460,20 @@ func (m *TypedMap[K, V]) Compute(key K, fn func(oldValue V, loaded bool) (newVal
 // CompareAndSwap atomically replaces old with new for key, returning true on
 // success. It fails if the key is absent, expired, or its current value differs.
 func (m *TypedMap[K, V]) CompareAndSwap(key K, old, new V) bool {
+	h := m.hash(key)
+	s := &m.shards[(h>>32)&m.shardMask]
+	e := m.find(s.table.Load(), h, key)
+	if e == nil {
+		return false
+	}
+	if e.enterFast() {
+		if e.meta.Load() == nil {
+			swapped := m.casVal(e, old, new)
+			e.exitFast()
+			return swapped
+		}
+		e.exitFast()
+	}
 	return m.compareAndSwapMeta(key, old, new, nil)
 }
 
@@ -474,6 +495,8 @@ func (m *TypedMap[K, V]) compareAndSwapMeta(key K, old, new V, md *typedMeta) bo
 	if e == nil {
 		return false
 	}
+	e.lockValue()
+	defer e.unlockValue()
 	if emd := e.meta.Load(); emd != nil && emd.deadForView(time.Now().UnixNano()) {
 		return false
 	}
@@ -490,6 +513,9 @@ func (m *TypedMap[K, V]) compareAndSwapMeta(key K, old, new V, md *typedMeta) bo
 func (m *TypedMap[K, V]) CompareAndDelete(key K, old V) bool {
 	h := m.hash(key)
 	s := &m.shards[(h>>32)&m.shardMask]
+	if m.find(s.table.Load(), h, key) == nil {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t := s.table.Load()
@@ -499,11 +525,13 @@ func (m *TypedMap[K, V]) CompareAndDelete(key K, old V) bool {
 		if e == nil {
 			return false
 		}
-		if e != m.tomb && e.hash == h && e.key == key {
+		if e != m.tomb && e.hash == uint32(h) && e.key == key {
 			if emd := e.meta.Load(); emd != nil && emd.deadForView(time.Now().UnixNano()) {
 				return false
 			}
+			e.lockValue()
 			if !m.valEqual(e, old) {
+				e.unlockValue()
 				return false
 			}
 			t.slots[idx].Store(m.tomb)
@@ -518,7 +546,11 @@ func (m *TypedMap[K, V]) CompareAndDelete(key K, old V) bool {
 
 // Snapshot returns every live key/value pair at the moment of the call.
 func (m *TypedMap[K, V]) Snapshot() []TypedPair[K, V] {
-	now := time.Now().UnixNano()
+	hasMeta := m.hasMeta.Load()
+	var now int64
+	if hasMeta {
+		now = time.Now().UnixNano()
+	}
 	out := make([]TypedPair[K, V], 0, m.Len())
 	for si := range m.shards {
 		t := m.shards[si].table.Load()
@@ -527,8 +559,10 @@ func (m *TypedMap[K, V]) Snapshot() []TypedPair[K, V] {
 			if e == nil || e == m.tomb {
 				continue
 			}
-			if md := e.meta.Load(); md != nil && md.deadForView(now) {
-				continue
+			if hasMeta {
+				if md := e.meta.Load(); md != nil && md.deadForView(now) {
+					continue
+				}
 			}
 			out = append(out, TypedPair[K, V]{Key: e.key, Value: m.loadVal(e)})
 		}
@@ -581,6 +615,7 @@ func (m *TypedMap[K, V]) Clear() {
 		s.table.Store(nt)
 		s.chunk = nil
 		s.off = 0
+		s.chunked = 0
 		s.mu.Unlock()
 	}
 }
@@ -611,7 +646,7 @@ func (m *TypedMap[K, V]) CleanupNow() {
 			s.mu.Unlock()
 			continue
 		}
-			size := targetTypedSlots(len(old.slots), int(old.count.Load()), int(old.tombstones.Load()))
+		size := targetTypedSlots(len(old.slots), int(old.count.Load()), int(old.tombstones.Load()))
 		nt := &typedTable[K]{
 			slots: make([]atomic.Pointer[typedEntry[K]], size),
 			mask:  uint64(size - 1),
@@ -625,7 +660,7 @@ func (m *TypedMap[K, V]) CleanupNow() {
 			if md := e.meta.Load(); md != nil && md.deadForView(now) {
 				continue
 			}
-			idx := e.hash & nt.mask
+			idx := m.homeSlot(e, nt.mask)
 			for nt.slots[idx].Load() != nil {
 				idx = (idx + 1) & nt.mask
 			}
@@ -634,7 +669,7 @@ func (m *TypedMap[K, V]) CleanupNow() {
 		}
 		nt.count.Store(cnt)
 		s.table.Store(nt)
-			s.mu.Unlock()
+		s.mu.Unlock()
 	}
 }
 
