@@ -7,6 +7,7 @@ import (
 	"github.com/guno1928/alosmap"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/puzpuzpuz/xsync/v4"
+	"gitlab.skybyte.cloud/tumult1337/tmap"
 )
 
 func BenchmarkX_Insert(b *testing.B) {
@@ -114,6 +115,20 @@ func BenchmarkX_Insert(b *testing.B) {
 		}
 	})
 
+	b.Run("tmap", func(b *testing.B) {
+		b.ReportAllocs()
+		m := tmap.New[string, int64](tmap.WithPresize(benchN))
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			m.Store(keys[i%benchN], int64(i))
+			if (i+1)%benchN == 0 {
+				b.StopTimer()
+				m = tmap.New[string, int64](tmap.WithPresize(benchN))
+				b.StartTimer()
+			}
+		}
+	})
+
 	b.Run("cmap", func(b *testing.B) {
 		b.ReportAllocs()
 		m := cmap.New[int64]()
@@ -198,6 +213,19 @@ func BenchmarkX_ParallelRead(b *testing.B) {
 		})
 	})
 
+	b.Run("tmap", func(b *testing.B) {
+		m := filledTmap(keys)
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				m.Load(keys[i%benchN])
+				i++
+			}
+		})
+	})
+
 	b.Run("cmap", func(b *testing.B) {
 		m := filledCmap(keys)
 		b.ReportAllocs()
@@ -270,6 +298,19 @@ func BenchmarkX_ParallelStore(b *testing.B) {
 
 	b.Run("xsync", func(b *testing.B) {
 		m := filledXsync(keys)
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				m.Store(keys[i%benchN], int64(i))
+				i++
+			}
+		})
+	})
+
+	b.Run("tmap", func(b *testing.B) {
+		m := filledTmap(keys)
 		b.ReportAllocs()
 		b.ResetTimer()
 		b.RunParallel(func(pb *testing.PB) {
@@ -373,6 +414,24 @@ func benchMixed(b *testing.B, readPct int) {
 
 	b.Run("xsync", func(b *testing.B) {
 		m := filledXsync(keys)
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				k := keys[i%benchN]
+				if i%100 < readPct {
+					m.Load(k)
+				} else {
+					m.Store(k, int64(i))
+				}
+				i++
+			}
+		})
+	})
+
+	b.Run("tmap", func(b *testing.B) {
+		m := filledTmap(keys)
 		b.ReportAllocs()
 		b.ResetTimer()
 		b.RunParallel(func(pb *testing.PB) {
@@ -506,6 +565,24 @@ func BenchmarkX_Delete(b *testing.B) {
 		})
 	})
 
+	b.Run("tmap", func(b *testing.B) {
+		m := filledTmap(keys)
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				k := keys[i%benchN]
+				if i&1 == 0 {
+					m.Delete(k)
+				} else {
+					m.Store(k, int64(i))
+				}
+				i++
+			}
+		})
+	})
+
 	b.Run("cmap", func(b *testing.B) {
 		m := filledCmap(keys)
 		b.ReportAllocs()
@@ -567,6 +644,15 @@ func BenchmarkX_Range(b *testing.B) {
 
 	b.Run("xsync", func(b *testing.B) {
 		m := filledXsync(keys)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			m.Range(func(_ string, _ int64) bool { return true })
+		}
+	})
+
+	b.Run("tmap", func(b *testing.B) {
+		m := filledTmap(keys)
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
@@ -700,6 +786,34 @@ func BenchmarkX_RangeWhileWriting(b *testing.B) {
 		wg.Wait()
 	})
 
+	b.Run("tmap", func(b *testing.B) {
+		m := filledTmap(keys)
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			i := 0
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					m.Store(keys[i%benchN], int64(i))
+					i++
+				}
+			}
+		}()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			m.Range(func(_ string, _ int64) bool { return true })
+		}
+		b.StopTimer()
+		close(stop)
+		wg.Wait()
+	})
+
 	b.Run("cmap", func(b *testing.B) {
 		m := filledCmap(keys)
 		stop := make(chan struct{})
@@ -783,6 +897,18 @@ func BenchmarkX_HotKeyRead(b *testing.B) {
 
 	b.Run("xsync", func(b *testing.B) {
 		m := xsync.NewMap[string, int64]()
+		m.Store(hot, 42)
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				m.Load(hot)
+			}
+		})
+	})
+
+	b.Run("tmap", func(b *testing.B) {
+		m := tmap.New[string, int64]()
 		m.Store(hot, 42)
 		b.ReportAllocs()
 		b.ResetTimer()

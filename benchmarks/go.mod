@@ -6,6 +6,7 @@ require (
 	github.com/guno1928/alosmap v0.0.0
 	github.com/orcaman/concurrent-map/v2 v2.0.1
 	github.com/puzpuzpuz/xsync/v4 v4.5.0
+	gitlab.skybyte.cloud/tumult1337/tmap v0.5.0
 )
 
 require (

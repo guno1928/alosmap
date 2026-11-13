@@ -12,6 +12,11 @@ const (
 	hashSeed1 = 0xe7037ed1a0b428db
 	hashSeed2 = 0x8ebc6af09c88c6e3
 	hashSeed3 = 0x589965cc75374cc3
+
+	hashTinyStringMin  = 1
+	hashShortStringMin = 4
+	hashMidStringMin   = 9
+	hashMidStringMax   = 16
 )
 
 func hashString(seed uint64, input string) uint64 {
@@ -25,23 +30,29 @@ func hashString(seed uint64, input string) uint64 {
 	}
 
 	base := unsafe.Pointer(unsafe.StringData(input))
-	acc := seed ^ (uint64(length) * hashSeed0)
 
-	if length <= 8 {
-		var lo, hi uint32
-		if length >= 4 {
-			lo = readUint32(base, 0)
-			hi = readUint32(base, length-4)
-		} else {
-			lo = uint32(*(*byte)(base))
-			lo |= uint32(*(*byte)(unsafe.Add(base, length>>1))) << 8
-			lo |= uint32(*(*byte)(unsafe.Add(base, length-1))) << 16
-			hi = 0
-		}
-		return mix(acc^uint64(lo)^hashSeed1, uint64(hi)^hashSeed2)
+	if length < hashShortStringMin {
+		return hashTinyString(seed, base, length)
 	}
+	if length < hashMidStringMin {
+		return hashShortString(seed, base, length)
+	}
+	return hashMidString(seed, base, length)
+}
 
-	return mix(acc^readUint64(base, 0)^hashSeed1, readUint64(base, length-8)^hashSeed2)
+func hashTinyString(seed uint64, base unsafe.Pointer, length int) uint64 {
+	lo := uint32(*(*byte)(base))
+	lo |= uint32(*(*byte)(unsafe.Add(base, length>>1))) << 8
+	lo |= uint32(*(*byte)(unsafe.Add(base, length-1))) << 16
+	return mix(seed^(uint64(length)*hashSeed0)^uint64(lo)^hashSeed1, hashSeed2)
+}
+
+func hashShortString(seed uint64, base unsafe.Pointer, length int) uint64 {
+	return mix(seed^(uint64(length)*hashSeed0)^uint64(readUint32(base, 0))^hashSeed1, uint64(readUint32(base, length-4))^hashSeed2)
+}
+
+func hashMidString(seed uint64, base unsafe.Pointer, length int) uint64 {
+	return mix(seed^(uint64(length)*hashSeed0)^readUint64(base, 0)^hashSeed1, readUint64(base, length-8)^hashSeed2)
 }
 
 func readUint32(base unsafe.Pointer, offset int) uint32 {

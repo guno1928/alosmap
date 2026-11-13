@@ -19,7 +19,8 @@ checkout.
 | `alosmap_typed` | `alosmap.TypedMap[string,int64]` (inline typed values) |
 | `sync.Map`      | standard library `sync.Map` |
 | `map+RWMutex`   | `map[string]int64` guarded by `sync.RWMutex` |
-| `xsync`         | [`puzpuzpuz/xsync/v3`](https://github.com/puzpuzpuz/xsync) `MapOf` |
+| `xsync`         | [`puzpuzpuz/xsync/v4`](https://github.com/puzpuzpuz/xsync) `Map` |
+| `tmap`          | [`tumult1337/tmap`](https://gitlab.skybyte.cloud/tumult1337/tmap) `Map` |
 | `cmap`          | [`orcaman/concurrent-map/v2`](https://github.com/orcaman/concurrent-map) |
 
 All cross-map benchmarks use `string` keys and `int64` values, 8 192 keys, and

@@ -44,6 +44,7 @@ import (
 	"github.com/guno1928/alosmap"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/puzpuzpuz/xsync/v4"
+	"gitlab.skybyte.cloud/tumult1337/tmap"
 )
 
 // concMap is the uniform surface every map is driven through.
@@ -184,6 +185,15 @@ func (a xsyncAd[V]) LoadOrStore(k string, v V) (V, bool) { return a.m.LoadOrStor
 func (a xsyncAd[V]) Range(fn func(k string, v V) bool)   { a.m.Range(fn) }
 func (a xsyncAd[V]) Len() int                            { return a.m.Size() }
 
+type tmapAd[V any] struct{ m *tmap.Map[string, V] }
+
+func (a tmapAd[V]) Store(k string, v V)                 { a.m.Store(k, v) }
+func (a tmapAd[V]) Load(k string) (V, bool)             { return a.m.Load(k) }
+func (a tmapAd[V]) Delete(k string)                     { a.m.Delete(k) }
+func (a tmapAd[V]) LoadOrStore(k string, v V) (V, bool) { return a.m.LoadOrStore(k, v) }
+func (a tmapAd[V]) Range(fn func(k string, v V) bool)   { a.m.Range(fn) }
+func (a tmapAd[V]) Len() int                            { return a.m.Len() }
+
 type cmapAd[V any] struct{ m cmap.ConcurrentMap[string, V] }
 
 func (a cmapAd[V]) Store(k string, v V)     { a.m.Set(k, v) }
@@ -247,6 +257,12 @@ func allMaps[V any]() []namedMap[V] {
 				return xsyncAd[V]{xsync.NewMap[string, V](xsync.WithPresize(n))}
 			}
 			return xsyncAd[V]{xsync.NewMap[string, V]()}
+		}},
+		{"tmap", func(n int) concMap[V] {
+			if n > 0 {
+				return tmapAd[V]{tmap.New[string, V](tmap.WithPresize(n))}
+			}
+			return tmapAd[V]{tmap.New[string, V]()}
 		}},
 		{"cmap", func(n int) concMap[V] { return cmapAd[V]{cmap.New[V]()} }},
 	}

@@ -4,22 +4,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 type typedMeta struct {
 	expireAt   int64
 	hits       atomic.Int64
+	bits       uint64
+	ptr        unsafe.Pointer
 	hitLimited bool
-}
-
-func (md *typedMeta) deadForView(now int64) bool {
-	if md.expireAt != 0 && now >= md.expireAt {
-		return true
-	}
-	if md.hitLimited && md.hits.Load() <= 0 {
-		return true
-	}
-	return false
 }
 
 func newTypedMeta(opt EntryOptions) *typedMeta {
@@ -56,38 +49,19 @@ type TypedStats struct {
 // Get returns the value stored for key and true, or the zero V and false when the
 // key is absent or expired. Like Load, Get consumes one hit on a hit-limited entry.
 func (m *TypedMap[K, V]) Get(key K) (V, bool) {
-	return m.Load(key)
+	return m.lookup(key, true)
 }
 
 // Has reports whether key is present and still live, without consuming a hit.
 func (m *TypedMap[K, V]) Has(key K) bool {
-	h := m.hash(key)
-	s := &m.shards[(h>>32)&m.shardMask]
-	e := m.find(s.table.Load(), h, key)
-	if e == nil {
-		return false
-	}
-	if md := e.meta.Load(); md != nil && md.deadForView(time.Now().UnixNano()) {
-		return false
-	}
-	return true
+	_, live := m.lookup(key, false)
+	return live
 }
 
 // Peek returns the value for key and true without consuming a hit, or the zero V
 // and false when the key is absent or expired.
 func (m *TypedMap[K, V]) Peek(key K) (V, bool) {
-	h := m.hash(key)
-	s := &m.shards[(h>>32)&m.shardMask]
-	e := m.find(s.table.Load(), h, key)
-	if e == nil {
-		var zero V
-		return zero, false
-	}
-	if md := e.meta.Load(); md != nil && md.deadForView(time.Now().UnixNano()) {
-		var zero V
-		return zero, false
-	}
-	return m.loadVal(e), true
+	return m.lookup(key, false)
 }
 
 // StoreWithTTL sets key to val with a time-to-live; the entry becomes invisible
@@ -120,60 +94,13 @@ func (m *TypedMap[K, V]) SetWithTTLAndHits(key K, val V, ttl time.Duration, hits
 }
 
 func (m *TypedMap[K, V]) putMeta(key K, val V, md *typedMeta) {
-	if md != nil {
-		m.hasMeta.Store(true)
-		m.maybeStartCleaner()
+	if md == nil {
+		m.Store(key, val)
+		return
 	}
-	h := m.hash(key)
-	s := &m.shards[(h>>32)&m.shardMask]
-
-	s.mu.Lock()
-	t := s.table.Load()
-	used := int(t.count.Load() + t.tombstones.Load())
-	if (used+1)*4 >= len(t.slots)*3 {
-		t = m.growLocked(s, t)
-	}
-	idx := h & t.mask
-	firstTomb := -1
-	for {
-		e := t.slots[idx].Load()
-		if e == nil {
-			ne := s.newEntry()
-			ne.hash = uint32(h)
-			ne.key = key
-			m.storeVal(ne, val)
-			ne.meta.Store(md)
-			if firstTomb >= 0 {
-				if t.slots[firstTomb].CompareAndSwap(m.tomb, ne) {
-					t.tombstones.Add(-1)
-					t.count.Add(1)
-					s.mu.Unlock()
-					return
-				}
-				firstTomb = -1
-				continue
-			}
-			if t.slots[idx].CompareAndSwap(nil, ne) {
-				t.count.Add(1)
-				s.mu.Unlock()
-				return
-			}
-			continue
-		}
-		if e == m.tomb {
-			if firstTomb < 0 {
-				firstTomb = int(idx)
-			}
-		} else if e.hash == uint32(h) && e.key == key {
-			e.lockValue()
-			m.storeVal(e, val)
-			e.meta.Store(md)
-			e.unlockValue()
-			s.mu.Unlock()
-			return
-		}
-		idx = (idx + 1) & t.mask
-	}
+	m.maybeStartCleaner()
+	_, h, _ := m.seek(key)
+	m.storeLocked(h, key, val, md)
 }
 
 // LoadOrStore returns the existing value for key and true if present and live,
@@ -184,163 +111,84 @@ func (m *TypedMap[K, V]) LoadOrStore(key K, val V) (V, bool) {
 
 // LoadOrStoreWithOptions is LoadOrStore that applies opt to a newly stored entry.
 func (m *TypedMap[K, V]) LoadOrStoreWithOptions(key K, val V, opt EntryOptions) (V, bool) {
-	return m.loadOrStoreMeta(key, val, newTypedMeta(opt))
+	md := newTypedMeta(opt)
+	if md != nil {
+		m.maybeStartCleaner()
+	}
+	return m.loadOrStoreMeta(key, val, md)
 }
 
 func (m *TypedMap[K, V]) loadOrStoreMeta(key K, val V, md *typedMeta) (V, bool) {
-	if md != nil {
-		m.hasMeta.Store(true)
-		m.maybeStartCleaner()
-	}
-	h := m.hash(key)
-	s := &m.shards[(h>>32)&m.shardMask]
-	if e := m.find(s.table.Load(), h, key); e != nil {
-		if emd := e.meta.Load(); emd == nil || !emd.deadForView(time.Now().UnixNano()) {
-			return m.loadVal(e), true
+	e, h, _ := m.seek(key)
+	if e != nil {
+		if v, state := m.peekEntry(e); state == typedStateLive {
+			return v, true
 		}
 	}
-
-	s.mu.Lock()
-	t := s.table.Load()
-	used := int(t.count.Load() + t.tombstones.Load())
-	if (used+1)*4 >= len(t.slots)*3 {
-		t = m.growLocked(s, t)
+	shardIndex := h & m.shardMask
+	s := &m.shards[shardIndex]
+	if !s.mu.TryLock() {
+		s.lockContended()
 	}
-	idx := h & t.mask
-	firstTomb := -1
-	for {
-		e := t.slots[idx].Load()
-		if e == nil {
-			ne := s.newEntry()
-			ne.hash = uint32(h)
-			ne.key = key
-			m.storeVal(ne, val)
-			ne.meta.Store(md)
-			if firstTomb >= 0 {
-				if t.slots[firstTomb].CompareAndSwap(m.tomb, ne) {
-					t.tombstones.Add(-1)
-					t.count.Add(1)
-					s.mu.Unlock()
-					return val, false
-				}
-				firstTomb = -1
-				continue
-			}
-			if t.slots[idx].CompareAndSwap(nil, ne) {
-				t.count.Add(1)
-				s.mu.Unlock()
-				return val, false
-			}
-			continue
-		}
-		if e == m.tomb {
-			if firstTomb < 0 {
-				firstTomb = int(idx)
-			}
-		} else if e.hash == uint32(h) && e.key == key {
-			if emd := e.meta.Load(); emd == nil || !emd.deadForView(time.Now().UnixNano()) {
-				v := m.loadVal(e)
-				s.mu.Unlock()
-				return v, true
-			}
-			e.lockValue()
-			m.storeVal(e, val)
-			e.meta.Store(md)
-			e.unlockValue()
-			s.mu.Unlock()
-			return val, false
-		}
-		idx = (idx + 1) & t.mask
+	t := m.roomLocked(s, shardIndex, m.needsEntry(val, md))
+	e, idx := m.locate(t, h, key)
+	if e == nil {
+		m.insertLocked(s, t, idx, h, key, val, md)
+		s.mu.Unlock()
+		return val, false
 	}
+	if v, state := m.readEntry(e, 0, false); state == typedStateLive {
+		s.mu.Unlock()
+		return v, true
+	}
+	m.exchangeLocked(s, t, idx, e, val, md)
+	s.mu.Unlock()
+	return val, false
 }
 
 // Swap stores val for key and returns the previous value with true, or the zero V
 // and false when the key was absent or expired.
 func (m *TypedMap[K, V]) Swap(key K, val V) (V, bool) {
-	h := m.hash(key)
-	s := &m.shards[(h>>32)&m.shardMask]
-	if e := m.find(s.table.Load(), h, key); e != nil && e.enterFast() {
-		if e.meta.Load() == nil {
-			prev := m.swapVal(e, val)
-			e.exitFast()
+	e, h, _ := m.seek(key)
+	if e != nil && !m.isMeta(e) {
+		if prev, swapped := m.tryFastSwap(e, val); swapped {
 			return prev, true
 		}
-		e.exitFast()
 	}
-	return m.swapMeta(key, val, nil)
+	return m.swapLocked(h, key, val, nil)
 }
 
 // SwapWithOptions is Swap that applies opt to the replacement value.
 func (m *TypedMap[K, V]) SwapWithOptions(key K, val V, opt EntryOptions) (V, bool) {
-	return m.swapMeta(key, val, newTypedMeta(opt))
-}
-
-func (m *TypedMap[K, V]) swapMeta(key K, val V, md *typedMeta) (V, bool) {
+	md := newTypedMeta(opt)
 	if md != nil {
-		m.hasMeta.Store(true)
 		m.maybeStartCleaner()
 	}
-	h := m.hash(key)
-	s := &m.shards[(h>>32)&m.shardMask]
+	_, h, _ := m.seek(key)
+	return m.swapLocked(h, key, val, md)
+}
 
-	s.mu.Lock()
-	t := s.table.Load()
-	used := int(t.count.Load() + t.tombstones.Load())
-	if (used+1)*4 >= len(t.slots)*3 {
-		t = m.growLocked(s, t)
+func (m *TypedMap[K, V]) swapLocked(h uint64, key K, val V, md *typedMeta) (V, bool) {
+	shardIndex := h & m.shardMask
+	s := &m.shards[shardIndex]
+	if !s.mu.TryLock() {
+		s.lockContended()
 	}
-	idx := h & t.mask
-	firstTomb := -1
-	for {
-		e := t.slots[idx].Load()
-		if e == nil {
-			ne := s.newEntry()
-			ne.hash = uint32(h)
-			ne.key = key
-			m.storeVal(ne, val)
-			ne.meta.Store(md)
-			if firstTomb >= 0 {
-				if t.slots[firstTomb].CompareAndSwap(m.tomb, ne) {
-					t.tombstones.Add(-1)
-					t.count.Add(1)
-					s.mu.Unlock()
-					var zero V
-					return zero, false
-				}
-				firstTomb = -1
-				continue
-			}
-			if t.slots[idx].CompareAndSwap(nil, ne) {
-				t.count.Add(1)
-				s.mu.Unlock()
-				var zero V
-				return zero, false
-			}
-			continue
-		}
-		if e == m.tomb {
-			if firstTomb < 0 {
-				firstTomb = int(idx)
-			}
-		} else if e.hash == uint32(h) && e.key == key {
-			e.lockValue()
-			prev := m.loadVal(e)
-			prevDead := false
-			if pmd := e.meta.Load(); pmd != nil && pmd.deadForView(time.Now().UnixNano()) {
-				prevDead = true
-			}
-			m.storeVal(e, val)
-			e.meta.Store(md)
-			e.unlockValue()
-			s.mu.Unlock()
-			if prevDead {
-				var zero V
-				return zero, false
-			}
-			return prev, true
-		}
-		idx = (idx + 1) & t.mask
+	t := m.roomLocked(s, shardIndex, m.needsEntry(val, md))
+	e, idx := m.locate(t, h, key)
+	if e == nil {
+		m.insertLocked(s, t, idx, h, key, val, md)
+		s.mu.Unlock()
+		var zero V
+		return zero, false
 	}
+	prev, live := m.exchangeLocked(s, t, idx, e, val, md)
+	s.mu.Unlock()
+	if !live {
+		var zero V
+		return zero, false
+	}
+	return prev, true
 }
 
 type ComputeOp int
@@ -354,219 +202,199 @@ const (
 const computeFastAttempts = 2
 
 func (m *TypedMap[K, V]) Compute(key K, fn func(oldValue V, loaded bool) (newValue V, op ComputeOp)) (V, bool) {
-	var zero V
-	h := m.hash(key)
-	s := &m.shards[(h>>32)&m.shardMask]
-	if e := m.find(s.table.Load(), h, key); e != nil {
-		for attempt := 0; attempt < computeFastAttempts && e.meta.Load() == nil; attempt++ {
-			old := m.loadVal(e)
+	found, h, _ := m.seek(key)
+	if e := found; e != nil && !m.isMeta(e) {
+		for attempt := 0; attempt < computeFastAttempts; attempt++ {
+			old, live := m.loadCell(e)
+			if !live {
+				break
+			}
 			newValue, op := fn(old, true)
 			if op == CancelOp {
 				return old, true
 			}
-			if op != UpdateOp || !e.enterFast() {
+			if op != UpdateOp || m.isReservedLiteral(newValue) {
 				break
 			}
-			if e.meta.Load() != nil {
-				e.exitFast()
-				break
-			}
-			swapped := m.casVal(e, old, newValue)
-			e.exitFast()
-			if swapped {
+			if m.casCell(e, old, newValue) {
 				return newValue, true
 			}
 		}
 	}
 
-	s.mu.Lock()
-	t := s.table.Load()
-	used := int(t.count.Load() + t.tombstones.Load())
-	if (used+1)*4 >= len(t.slots)*3 {
-		t = m.growLocked(s, t)
+	shardIndex := h & m.shardMask
+	s := &m.shards[shardIndex]
+	if !s.mu.TryLock() {
+		s.lockContended()
 	}
-	idx := h & t.mask
-	firstTomb := -1
-	for probes := 0; probes < len(t.slots); probes++ {
-		e := t.slots[idx].Load()
-		if e == nil {
-			newValue, op := fn(zero, false)
-			if op != UpdateOp {
-				s.mu.Unlock()
-				return zero, false
-			}
-			ne := s.newEntry()
-			ne.hash = uint32(h)
-			ne.key = key
-			m.storeVal(ne, newValue)
-			if firstTomb >= 0 {
-				if t.slots[firstTomb].CompareAndSwap(m.tomb, ne) {
-					t.tombstones.Add(-1)
-					t.count.Add(1)
-					s.mu.Unlock()
+	defer s.mu.Unlock()
+	t := m.roomLocked(s, shardIndex, false)
+	e, idx := m.locate(t, h, key)
+	var zero V
+	if e == nil {
+		return m.computeAbsentLocked(s, t, idx, h, key, fn)
+	}
+	if m.isMeta(e) {
+		old, state := m.readEntry(e, 0, false)
+		loaded := state == typedStateLive
+		if !loaded {
+			old = zero
+		}
+		newValue, op := fn(old, loaded)
+		switch op {
+		case UpdateOp:
+			m.exchangeLocked(s, t, idx, e, newValue, nil)
+			return newValue, true
+		case DeleteOp:
+			m.sealCell(e)
+			m.vacateLocked(s, t, idx)
+			return old, false
+		default:
+			return old, loaded
+		}
+	}
+	for {
+		old, live := m.loadCell(e)
+		if !live {
+			return m.computeAbsentLocked(s, t, idx, h, key, fn)
+		}
+		newValue, op := fn(old, true)
+		switch op {
+		case UpdateOp:
+			if md := m.metaFor(newValue, nil); md == nil {
+				if m.casCell(e, old, newValue) {
 					return newValue, true
 				}
-				firstTomb = -1
-				continue
-			}
-			if t.slots[idx].CompareAndSwap(nil, ne) {
-				t.count.Add(1)
-				s.mu.Unlock()
-				return newValue, true
-			}
-			continue
-		}
-		if e == m.tomb {
-			if firstTomb < 0 {
-				firstTomb = int(idx)
-			}
-		} else if e.hash == uint32(h) && e.key == key {
-			e.lockValue()
-			old := zero
-			loaded := true
-			if md := e.meta.Load(); md != nil && md.deadForView(time.Now().UnixNano()) {
-				loaded = false
-			} else {
-				old = m.loadVal(e)
-			}
-			newValue, op := fn(old, loaded)
-			switch op {
-			case UpdateOp:
-				m.storeVal(e, newValue)
-				if e.meta.Load() != nil {
-					e.meta.Store(nil)
+			} else if t.flat() {
+				t = m.promoteLocked(s, shardIndex, t)
+				if e, idx = m.locate(t, h, key); e == nil {
+					return m.computeAbsentLocked(s, t, idx, h, key, fn)
 				}
-				e.unlockValue()
-				s.mu.Unlock()
+			} else if m.sealCellIf(e, old) {
+				m.replaceLocked(s, t, idx, e, newValue, md)
 				return newValue, true
-			case DeleteOp:
-				t.slots[idx].Store(m.tomb)
-				t.count.Add(-1)
-				t.tombstones.Add(1)
-				s.mu.Unlock()
-				return old, false
-			default:
-				e.unlockValue()
-				s.mu.Unlock()
-				return old, loaded
 			}
+		case DeleteOp:
+			if m.retireIf(s, t, idx, e, old) {
+				return old, false
+			}
+		default:
+			return old, true
 		}
-		idx = (idx + 1) & t.mask
 	}
-	s.mu.Unlock()
-	return zero, false
 }
 
 // CompareAndSwap atomically replaces old with new for key, returning true on
 // success. It fails if the key is absent, expired, or its current value differs.
+func (m *TypedMap[K, V]) computeAbsentLocked(s *typedShard, t typedTable, idx, h uint64, key K, fn func(oldValue V, loaded bool) (newValue V, op ComputeOp)) (V, bool) {
+	var zero V
+	newValue, op := fn(zero, false)
+	if op != UpdateOp {
+		return zero, false
+	}
+	if t.flat() && m.isReservedLiteral(newValue) {
+		t = m.promoteLocked(s, h&m.shardMask, t)
+		_, idx = m.locate(t, h, key)
+	}
+	m.insertLocked(s, t, idx, h, key, newValue, nil)
+	return newValue, true
+}
+
 func (m *TypedMap[K, V]) CompareAndSwap(key K, old, new V) bool {
-	h := m.hash(key)
-	s := &m.shards[(h>>32)&m.shardMask]
-	e := m.find(s.table.Load(), h, key)
+	e, h, _ := m.seek(key)
 	if e == nil {
 		return false
 	}
-	if e.enterFast() {
-		if e.meta.Load() == nil {
-			swapped := m.casVal(e, old, new)
-			e.exitFast()
-			return swapped
+	if !m.isMeta(e) && !m.isReservedLiteral(old) && !m.isReservedLiteral(new) {
+		if m.casCell(e, old, new) {
+			return true
 		}
-		e.exitFast()
+		if _, live := m.loadCell(e); live {
+			return false
+		}
 	}
-	return m.compareAndSwapMeta(key, old, new, nil)
+	return m.compareAndSwapLocked(h, key, old, new, nil)
 }
 
 // CompareAndSwapWithOptions is CompareAndSwap that applies opt to new on success.
 func (m *TypedMap[K, V]) CompareAndSwapWithOptions(key K, old, new V, opt EntryOptions) bool {
-	return m.compareAndSwapMeta(key, old, new, newTypedMeta(opt))
-}
-
-func (m *TypedMap[K, V]) compareAndSwapMeta(key K, old, new V, md *typedMeta) bool {
+	md := newTypedMeta(opt)
 	if md != nil {
-		m.hasMeta.Store(true)
 		m.maybeStartCleaner()
 	}
-	h := m.hash(key)
-	s := &m.shards[(h>>32)&m.shardMask]
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e := m.find(s.table.Load(), h, key)
-	if e == nil {
-		return false
+	_, h, _ := m.seek(key)
+	return m.compareAndSwapLocked(h, key, old, new, md)
+}
+
+func (m *TypedMap[K, V]) compareAndSwapLocked(h uint64, key K, old, new V, md *typedMeta) bool {
+	shardIndex := h & m.shardMask
+	s := &m.shards[shardIndex]
+	if !s.mu.TryLock() {
+		s.lockContended()
 	}
-	e.lockValue()
-	defer e.unlockValue()
-	if emd := e.meta.Load(); emd != nil && emd.deadForView(time.Now().UnixNano()) {
-		return false
+	t := m.tableAt(shardIndex)
+	if t.flat() && m.needsEntry(new, md) {
+		t = m.promoteLocked(s, shardIndex, t)
 	}
-	if !m.valEqual(e, old) {
-		return false
+	e, idx := m.locate(t, h, key)
+	swapped := false
+	switch {
+	case e == nil:
+	case m.isMeta(e):
+		if current, state := m.readEntry(e, 0, false); state == typedStateLive && m.sameValue(current, old) {
+			m.exchangeLocked(s, t, idx, e, new, md)
+			swapped = true
+		}
+	case m.isReservedLiteral(old):
+	default:
+		if next := m.metaFor(new, md); next == nil {
+			swapped = m.casCell(e, old, new)
+		} else if m.sealCellIf(e, old) {
+			m.replaceLocked(s, t, idx, e, new, next)
+			swapped = true
+		}
 	}
-	m.storeVal(e, new)
-	e.meta.Store(md)
-	return true
+	s.mu.Unlock()
+	return swapped
 }
 
 // CompareAndDelete removes key only if its current value equals old, returning true
 // on success.
 func (m *TypedMap[K, V]) CompareAndDelete(key K, old V) bool {
-	h := m.hash(key)
-	s := &m.shards[(h>>32)&m.shardMask]
-	if m.find(s.table.Load(), h, key) == nil {
+	found, h, _ := m.seek(key)
+	if found == nil {
 		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	t := s.table.Load()
-	idx := h & t.mask
-	for probes := 0; probes < len(t.slots); probes++ {
-		e := t.slots[idx].Load()
-		if e == nil {
-			return false
-		}
-		if e != m.tomb && e.hash == uint32(h) && e.key == key {
-			if emd := e.meta.Load(); emd != nil && emd.deadForView(time.Now().UnixNano()) {
-				return false
-			}
-			e.lockValue()
-			if !m.valEqual(e, old) {
-				e.unlockValue()
-				return false
-			}
-			t.slots[idx].Store(m.tomb)
-			t.count.Add(-1)
-			t.tombstones.Add(1)
-			return true
-		}
-		idx = (idx + 1) & t.mask
+	shardIndex := h & m.shardMask
+	s := &m.shards[shardIndex]
+	if !s.mu.TryLock() {
+		s.lockContended()
 	}
-	return false
+	t := m.tableAt(shardIndex)
+	e, idx := m.locate(t, h, key)
+	deleted := false
+	switch {
+	case e == nil:
+	case m.isMeta(e):
+		if current, state := m.readEntry(e, 0, false); state == typedStateLive && m.sameValue(current, old) {
+			m.sealCell(e)
+			m.vacateLocked(s, t, idx)
+			deleted = true
+		}
+	default:
+		deleted = !m.isReservedLiteral(old) && m.retireIf(s, t, idx, e, old)
+	}
+	s.mu.Unlock()
+	return deleted
 }
 
 // Snapshot returns every live key/value pair at the moment of the call.
 func (m *TypedMap[K, V]) Snapshot() []TypedPair[K, V] {
-	hasMeta := m.hasMeta.Load()
-	var now int64
-	if hasMeta {
-		now = time.Now().UnixNano()
-	}
 	out := make([]TypedPair[K, V], 0, m.Len())
-	for si := range m.shards {
-		t := m.shards[si].table.Load()
-		for j := range t.slots {
-			e := t.slots[j].Load()
-			if e == nil || e == m.tomb {
-				continue
-			}
-			if hasMeta {
-				if md := e.meta.Load(); md != nil && md.deadForView(now) {
-					continue
-				}
-			}
-			out = append(out, TypedPair[K, V]{Key: e.key, Value: m.loadVal(e)})
-		}
-	}
+	m.Range(func(key K, value V) bool {
+		out = append(out, TypedPair[K, V]{Key: key, Value: value})
+		return true
+	})
 	return out
 }
 
@@ -576,28 +404,22 @@ func (m *TypedMap[K, V]) RangePar(visitor func(key K, value V) bool) {
 	now := time.Now().UnixNano()
 	var stop atomic.Bool
 	var wg sync.WaitGroup
-	for si := range m.shards {
-		t := m.shards[si].table.Load()
+	guarded := func(key K, value V) bool {
+		if stop.Load() {
+			return false
+		}
+		if !visitor(key, value) {
+			stop.Store(true)
+			return false
+		}
+		return true
+	}
+	for shardIndex := range m.shards {
 		wg.Add(1)
-		go func(t *typedTable[K]) {
+		go func(shardIndex uint64) {
 			defer wg.Done()
-			for j := range t.slots {
-				if stop.Load() {
-					return
-				}
-				e := t.slots[j].Load()
-				if e == nil || e == m.tomb {
-					continue
-				}
-				if md := e.meta.Load(); md != nil && md.deadForView(now) {
-					continue
-				}
-				if !visitor(e.key, m.loadVal(e)) {
-					stop.Store(true)
-					return
-				}
-			}
-		}(t)
+			m.scanShard(shardIndex, now, guarded)
+		}(uint64(shardIndex))
 	}
 	wg.Wait()
 }
@@ -605,70 +427,58 @@ func (m *TypedMap[K, V]) RangePar(visitor func(key K, value V) bool) {
 // Clear removes every entry, leaving an empty map.
 func (m *TypedMap[K, V]) Clear() {
 	for i := range m.shards {
+		shardIndex := uint64(i)
 		s := &m.shards[i]
-		s.mu.Lock()
-		old := s.table.Load()
-		nt := &typedTable[K]{
-			slots: make([]atomic.Pointer[typedEntry[K]], len(old.slots)),
-			mask:  old.mask,
+		if !s.mu.TryLock() {
+			s.lockContended()
 		}
-		s.table.Store(nt)
+		m.resetLocked(s, shardIndex)
 		s.chunk = nil
+		s.chunkLen = 0
 		s.off = 0
 		s.chunked = 0
 		s.mu.Unlock()
 	}
 }
 
-// CleanupNow rebuilds every shard, dropping expired, hit-exhausted, and tombstoned
-// slots. TypedMap has no background cleanup, so call this to reclaim space.
-func (m *TypedMap[K, V]) CleanupNow() {
-	now := time.Now().UnixNano()
-	for i := range m.shards {
-		s := &m.shards[i]
-		s.mu.Lock()
-		old := s.table.Load()
-		reclaimable := false
-		for j := range old.slots {
-			e := old.slots[j].Load()
-			if e == m.tomb {
-				reclaimable = true
-				break
-			}
-			if e != nil {
-				if md := e.meta.Load(); md != nil && md.deadForView(now) {
-					reclaimable = true
-					break
-				}
-			}
-		}
-		if !reclaimable {
-			s.mu.Unlock()
+func (m *TypedMap[K, V]) staleLocked(s *typedShard, t typedTable, hasMeta bool, now int64) bool {
+	if t.flat() {
+		return s.used > s.live(t)
+	}
+	return hasMeta && m.hasDeadLocked(t, now)
+}
+
+func (m *TypedMap[K, V]) hasDeadLocked(t typedTable, now int64) bool {
+	for pos := uint64(0); pos < t.words(); pos++ {
+		p := t.entryAt(pos)
+		if p == nil {
 			continue
 		}
-		size := targetTypedSlots(len(old.slots), int(old.count.Load()), int(old.tombstones.Load()))
-		nt := &typedTable[K]{
-			slots: make([]atomic.Pointer[typedEntry[K]], size),
-			mask:  uint64(size - 1),
+		if e := (*typedEntry[K])(p); m.isMeta(e) {
+			if _, state := m.readEntry(e, now, false); state == typedStateDead {
+				return true
+			}
 		}
-		var cnt int64
-		for j := range old.slots {
-			e := old.slots[j].Load()
-			if e == nil || e == m.tomb {
-				continue
-			}
-			if md := e.meta.Load(); md != nil && md.deadForView(now) {
-				continue
-			}
-			idx := m.homeSlot(e, nt.mask)
-			for nt.slots[idx].Load() != nil {
-				idx = (idx + 1) & nt.mask
-			}
-			nt.slots[idx].Store(e)
-			cnt++
+	}
+	return false
+}
+
+// CleanupNow rebuilds every shard that holds expired or hit-exhausted entries or
+// an oversized table. TypedMap has no background cleanup, so call this to reclaim
+// space.
+func (m *TypedMap[K, V]) CleanupNow() {
+	now := time.Now().UnixNano()
+	hasMeta := m.hasMeta.Load()
+	for i := range m.shards {
+		shardIndex := uint64(i)
+		s := &m.shards[i]
+		if !s.mu.TryLock() {
+			s.lockContended()
 		}
-		nt.count.Store(cnt)
-		s.table.Store(nt)
+		t := m.tableAt(shardIndex)
+		if s.wantGroups(t) < t.groups() || m.staleLocked(s, t, hasMeta, now) {
+			m.rebuildLocked(s, shardIndex, t, true, now, nil)
+		}
 		s.mu.Unlock()
 	}
 }
@@ -692,23 +502,21 @@ func (m *TypedMap[K, V]) Stats() TypedStats {
 	now := time.Now().UnixNano()
 	st := TypedStats{Shards: len(m.shards)}
 	for i := range m.shards {
-		t := m.shards[i].table.Load()
-		st.SlotCapacity += len(t.slots)
-		tomb := t.tombstones.Load()
-		if tomb < 0 {
-			tomb = 0
+		t := m.viewAt(uint64(i))
+		st.SlotCapacity += t.slotCapacity()
+		if t.flat() {
+			m.flatStats(t, &st)
+			continue
 		}
-		st.Tombstones += tomb
-		for j := range t.slots {
-			e := t.slots[j].Load()
-			if e == nil || e == m.tomb {
+		for pos := uint64(0); pos < t.words(); pos++ {
+			p := t.entryAt(pos)
+			if p == nil {
 				continue
 			}
 			st.UsedSlots++
-			if md := e.meta.Load(); md != nil && md.deadForView(now) {
-				continue
+			if _, state := m.readEntry((*typedEntry[K])(p), now, false); state == typedStateLive {
+				st.LiveEntries++
 			}
-			st.LiveEntries++
 		}
 	}
 	if st.SlotCapacity > 0 {
