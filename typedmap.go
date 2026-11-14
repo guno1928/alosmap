@@ -274,7 +274,7 @@ func (t typedTable) entryAt(pos uint64) unsafe.Pointer {
 func (t typedTable) stepOverflow(h, group, delta uint64) {
 	for home := h >> t.shift; home != group; home = (home + 1) & t.mask {
 		if c := t.ctrl(home); c.Load() < typedOverflowMax {
-			publishWord(c, c.Load()+delta)
+			c.Store(c.Load() + delta)
 		}
 	}
 }
@@ -282,14 +282,14 @@ func (t typedTable) stepOverflow(h, group, delta uint64) {
 func (t typedTable) occupy(pos, h uint64) {
 	group := pos / typedGroupWords
 	c := t.ctrl(group)
-	publishWord(c, c.Load()|typedFingerprint(h)<<typedCtrlByteShift(pos))
+	c.Store(c.Load() | typedFingerprint(h)<<typedCtrlByteShift(pos))
 	t.stepOverflow(h, group, typedOverflowUp)
 }
 
 func (t typedTable) release(pos, h uint64) {
 	group := pos / typedGroupWords
 	c := t.ctrl(group)
-	publishWord(c, c.Load()&^(typedCtrlByteMask<<typedCtrlByteShift(pos)))
+	c.Store(c.Load() &^ (typedCtrlByteMask << typedCtrlByteShift(pos)))
 	t.stepOverflow(h, group, typedOverflowDown)
 }
 
@@ -1088,13 +1088,13 @@ func (m *TypedMap[K, V]) insertLocked(s *typedShard, t typedTable, pos uint64, h
 		m.flatInsertLocked(s, t, pos, h, key, val)
 		return
 	}
-	publishPointer(t.slot(pos), unsafe.Pointer(m.newEntry(s, h, key, val, m.metaFor(val, md))))
+	atomic.StorePointer(t.slot(pos), unsafe.Pointer(m.newEntry(s, h, key, val, m.metaFor(val, md))))
 	t.occupy(pos, h)
-	publishCount(&s.count, 1)
+	s.count.Add(1)
 }
 
 func (m *TypedMap[K, V]) replaceLocked(s *typedShard, t typedTable, pos uint64, old *typedEntry[K], val V, md *typedMeta) {
-	publishPointer(t.slot(pos), unsafe.Pointer(m.newEntry(s, m.entryHash(old), old.key, val, md)))
+	atomic.StorePointer(t.slot(pos), unsafe.Pointer(m.newEntry(s, m.entryHash(old), old.key, val, md)))
 }
 
 func (m *TypedMap[K, V]) exchangeLocked(s *typedShard, t typedTable, idx uint64, e *typedEntry[K], val V, md *typedMeta) (V, bool) {
@@ -1123,8 +1123,8 @@ func (m *TypedMap[K, V]) exchangeLocked(s *typedShard, t typedTable, idx uint64,
 func (m *TypedMap[K, V]) vacateLocked(s *typedShard, t typedTable, pos uint64) {
 	e := (*typedEntry[K])(atomic.LoadPointer(t.slot(pos)))
 	t.release(pos, m.entryHash(e))
-	publishPointer(t.slot(pos), nil)
-	publishCount(&s.count, -1)
+	atomic.StorePointer(t.slot(pos), nil)
+	s.count.Add(-1)
 }
 
 func (m *TypedMap[K, V]) removeLocked(s *typedShard, t typedTable, idx uint64, e *typedEntry[K]) (V, bool) {

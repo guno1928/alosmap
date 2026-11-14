@@ -29,8 +29,8 @@
 !/spin_amd64.go
 !/spin_amd64.s
 !/spin_generic.go
-!/publish_tso.go
-!/publish_atomic.go
+!/touch_amd64.go
+!/touch_generic.go
 !/typedflat.go
 
 # Benchmark suite (separate module). Its own .gitignore drops results/.

@@ -10,6 +10,8 @@ const (
 	typedMovedBits        uint64 = typedSealBits + 2
 	typedDeadBits         uint64 = typedSealBits + 3
 	typedReservedCount           = 4
+	typedFlatTouchSlot           = 0
+	typedFlatTouchOffset         = 8
 	typedFlatSlots               = 4
 	typedFlatSlotBytes           = 16
 	typedFlatLineBytes           = typedFlatSlots * typedFlatSlotBytes
@@ -216,17 +218,25 @@ func (m *TypedMap[K, V]) flatLocate(t typedTable, h uint64, key K) (*typedEntry[
 	}
 }
 
+func settleFlatValue(cell *atomic.Uint64, pos, bits uint64) {
+	if (pos-1)%typedFlatSlots == typedFlatTouchSlot {
+		cell.Store(bits)
+		return
+	}
+	*(*uint64)(unsafe.Pointer(cell)) = bits
+}
+
 func (m *TypedMap[K, V]) flatInsertLocked(s *typedShard, t typedTable, pos, h uint64, key K, val V) {
 	e := (*typedEntry[K])(t.flatSlot(pos))
-	publishCount(&s.count, 1)
+	s.count.Add(1)
 	if t.tagged(pos) {
-		publishWord(&e.val, toBits(val))
+		e.val.Store(toBits(val))
 		return
 	}
 	e.key = key
-	m.initCell(e, val)
+	settleFlatValue(&e.val, pos, toBits(val))
 	c := t.lanes((pos - 1) / typedFlatSlots)
-	publishWord(c, c.Load()|typedFlatTag(h)<<typedLaneShift(pos))
+	c.Store(c.Load() | typedFlatTag(h)<<typedLaneShift(pos))
 	s.used++
 }
 
@@ -235,8 +245,8 @@ func (m *TypedMap[K, V]) flatExchangeLocked(s *typedShard, e *typedEntry[K], val
 	for {
 		old := e.val.Load()
 		if old == typedDeadBits {
-			publishCount(&s.count, 1)
-			publishWord(&e.val, next)
+			s.count.Add(1)
+			e.val.Store(next)
 			var zero V
 			return zero, false
 		}
@@ -277,7 +287,7 @@ func (m *TypedMap[K, V]) flatRemoveLocked(s *typedShard, e *typedEntry[K]) (V, b
 		var zero V
 		return zero, false
 	}
-	publishCount(&s.count, -1)
+	s.count.Add(-1)
 	return fromBits[V](b), true
 }
 
@@ -286,7 +296,7 @@ func (m *TypedMap[K, V]) retireIf(s *typedShard, t typedTable, pos uint64, e *ty
 		if !e.val.CompareAndSwap(toBits(old), typedDeadBits) {
 			return false
 		}
-		publishCount(&s.count, -1)
+		s.count.Add(-1)
 		return true
 	}
 	if !m.sealCellIf(e, old) {
@@ -308,11 +318,11 @@ func (m *TypedMap[K, V]) flatMove(nt typedTable, src *typedEntry[K], b uint64) b
 		pos := typedFlatPos(group, empty)
 		dst := (*typedEntry[K])(nt.flatSlot(pos))
 		dst.key = src.key
-		publishWord(&dst.val, b)
-		publishWord(c, word|typedFlatTag(h)<<typedLaneShift(pos))
+		dst.val.Store(b)
+		c.Store(word | typedFlatTag(h)<<typedLaneShift(pos))
 		for !src.val.CompareAndSwap(b, typedMovedBits) {
 			b = src.val.Load()
-			publishWord(&dst.val, b)
+			dst.val.Store(b)
 		}
 		return b != typedDeadBits
 	}

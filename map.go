@@ -1651,26 +1651,20 @@ func (s *shard) readEntry(current *entry, consumeHits bool) (any, bool) {
 }
 
 func (s *shard) readEntryConsumeHit(current *entry, boxed *valueBox) (any, bool) {
-	for {
-		consumed, exhausted := boxed.consumeHit()
-		if !consumed {
-			if s.reap(current, boxed, false, true) {
-				s.maybeResize()
-				return nil, false
-			}
-			boxed = current.value.Load()
-			if boxed == nil {
-				return nil, false
-			}
-			continue
-		}
-		value, live := boxed.liveVal()
-		if exhausted {
-			s.reap(current, boxed, false, true)
+	consumed, exhausted := boxed.consumeHit()
+	if !consumed {
+		if s.reap(current, boxed, false, true) {
 			s.maybeResize()
+			return nil, false
 		}
-		return value, live
+		return s.readEntrySlow(current, true)
 	}
+	value, live := boxed.liveVal()
+	if exhausted {
+		s.reap(current, boxed, false, true)
+		s.maybeResize()
+	}
+	return value, live
 }
 
 func (s *shard) readEntrySlow(current *entry, consumeHits bool) (any, bool) {
